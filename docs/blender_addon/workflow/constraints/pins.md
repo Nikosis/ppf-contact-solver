@@ -127,12 +127,58 @@ the pin's own properties:
 - **Pull**: a checkbox with a **Strength** field next to it. When on,
   the pin no longer hard-constrains the vertices; instead, it pulls them
   toward their target positions as a soft force of the given strength.
+- **Allow Intersections Here**: a checkbox. When on, the geometry this pin
+  holds completely may overlap other geometry without stopping the
+  simulation. See
+  [Allow Intersections Here](#allow-intersections-here) below.
 - **Operations UIList**: a list of the operations stacked on this pin,
   each row showing the operation type.
 
 **Pull** is mutually exclusive with movement operations, since the solver
 would have no target to pull toward. The UI reflects this by disabling
 incompatible controls.
+
+### Allow Intersections Here
+
+A simulation is refused if the geometry it starts from is already
+overlapping, and it stops if an overlap shows up while it runs. **Allow
+Intersections Here** lifts that refusal for the geometry one pin holds. That
+is narrower than the group settings, which cover every object assigned to the
+group.
+
+Turn it on when the pin drives its vertices somewhere that has to pass
+through something: a cuff pulled onto a wrist that starts inside it, or a
+band captured from a rig-deformed pose that arrives folded into the body
+underneath. A plain pin puts its vertices exactly where it says, so the
+solver cannot move them out of an overlap they land in; a **Pull** pin holds
+them only as hard as its **Strength**. The option is available on both.
+
+**It applies only where the pin holds a whole element.** A triangle counts
+when all three of its corners are pinned, a rod segment when both of its
+ends are, a **Sand** grain when that one grain is, and every pin holding
+those vertices has to have the option on, not just one of them. A face with
+one free corner is not covered, so a band pinned along a single edge leaves
+the cloth around it reporting overlaps as usual. While the option is on, the
+add-on shows "Fully pinned faces may overlap; partly pinned ones still
+report" under the checkbox.
+
+:::{important}
+This suppresses the error, not the collision. Contact still acts across the
+overlap and the solver still pushes the surfaces apart. Nothing outside the
+elements this pin covers is affected, and every other overlap in the scene
+is still reported.
+:::
+
+The checkbox sits with every pin the add-on offers. On **Solid**, **Shell**,
+**Rod**, and **Sand** groups it is in the pin details panel described above;
+on a **PDRD** group it is in the **Pins & Motion** section, just above
+**Motion steps**, with the same note under it. A **Static** group is driven
+by **Transform** operations rather than pins, so it has no pin to put the
+checkbox on. For an overlap that is not confined to a pinned region, use the
+group-level
+[Allow Intersections](../params/material.md#allow-intersections) settings
+instead, on the group that is simulated: a **Static** collider left in its
+rest pose carries neither of those either.
 
 ### Edit-Mode Pin Buttons
 
@@ -447,6 +493,7 @@ into a new resting configuration before letting it fall freely.
 | **Include**                   | `included`                          | Pin is active for the current solve.                          |
 | **Duration** / **Active For** | `use_pin_duration` / `pin_duration` | Release the pin at the given frame (`pin.unpin(frame=...)`).    |
 | **Pull** / **Strength**       | `use_pull` / `pull_strength`        | Replace the hard pin with a soft pull force.                  |
+| **Allow Intersections Here**  | `allow_intersection`                | Accept overlaps of the elements this pin holds completely, instead of stopping the run. |
 
 ## Operations Reference
 

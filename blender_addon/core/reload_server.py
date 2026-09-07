@@ -87,7 +87,17 @@ def _resolve_addon_names() -> tuple[str, set[str], str, set[str]]:
             actual_addon_name = candidate
             break
     if not actual_addon_name:
-        actual_addon_name = short_addon_id
+        # Nothing in preferences matched. That is the normal state when
+        # Blender was started with ``--addons <name>``: the extension is
+        # enabled for the session but never listed in
+        # ``preferences.addons``, which is the only place the loop above
+        # can look. Fall back to the ``bl_ext`` prefix this very module is
+        # loaded under, because that name is importable by construction:
+        # the code deciding it is running from inside it. The bare short id
+        # is a last resort and need not resolve to anything, so preferring
+        # it here hands ``addon_enable`` a name that raises ModuleNotFound
+        # and leaves the addon disabled.
+        actual_addon_name = bl_ext_prefix or short_addon_id
 
     # Prefixes we must purge from sys.modules. Includes the resolved
     # addon name PLUS any alias seen in sys.modules so both legacy and
@@ -392,8 +402,15 @@ class ReloadServer:
             )
             self._reload_phase2_enable(ctx)
         except Exception as e:
+            # Re-raise after logging. The socket dispatcher wraps this call
+            # precisely so it can answer "error" instead of "ok", and
+            # swallowing here defeats that: the addon is left disabled while
+            # the client is told the reload succeeded, and every later
+            # command then fails for a reason that points nowhere near the
+            # reload.
             print(f"Reload failed: {e}")
             traceback.print_exc()
+            raise
 
     def perform_full_reload(self, on_success=None, on_error=None) -> None:
         """Run a full (two-phase) reload, splitting disable and enable across

@@ -9,6 +9,7 @@ import json
 import numpy as np
 
 from ...models.groups import get_addon_data, iterate_object_groups
+from ...models.material_maps import to_solver_value
 from . import (
     _normalize_and_scale,
     _swap_axes,
@@ -19,6 +20,9 @@ from . import (
     resolve_time_scale,
 )
 from .dyn import _encode_dyn_params, _encode_invisible_colliders
+from .scene_anim import encode_scene_param_anim
+from .param_anim import encode_param_anim
+from .material_maps import encode_material_maps
 from .mesh import compute_group_bounding_box_diagonal, evaluate_at_start_frame
 from .pin import _encode_pin_config
 
@@ -26,6 +30,17 @@ from .pin import _encode_pin_config
 _FTETWILD_FLOAT_FIELDS = ("edge_length_fac", "epsilon", "stop_energy")
 _FTETWILD_INT_FIELDS = ("num_opt_iter",)
 _FTETWILD_BOOL_FIELDS = ("optimize", "simplify", "coarsen")
+
+
+def _solver_value_or_zero(group, key: str, ui_value) -> float:
+    """`key` in solver units, or 0.0 when the group's feature toggle is off.
+
+    Zero is what a closed gate means for a static parameter: the solver builds
+    the group with the term switched off. A map target has no such reading, so
+    `encode_material_maps` refuses one instead of substituting a value.
+    """
+    value = to_solver_value(group, key, ui_value)
+    return 0.0 if value is None else value
 
 
 def _encode_obj_tet_kwargs(assigned) -> dict:
@@ -300,6 +315,10 @@ def _encode_group_params(context, groups, state, fps, start_frame):
                 "lock-translation",
                 "lock-rotation",
                 "lock-rotation-prohibit-axis",
+                "lock-all-translations",
+                "lock-all-rotations",
+                "allow-self-intersection",
+                "allow-inter-object-intersection",
             ],
             "SHELL": [
                 "density",
@@ -332,6 +351,10 @@ def _encode_group_params(context, groups, state, fps, start_frame):
                 "lock-translation",
                 "lock-rotation",
                 "lock-rotation-prohibit-axis",
+                "lock-all-translations",
+                "lock-all-rotations",
+                "allow-self-intersection",
+                "allow-inter-object-intersection",
             ],
             "ROD": [
                 "density",
@@ -355,12 +378,18 @@ def _encode_group_params(context, groups, state, fps, start_frame):
                 "lock-translation",
                 "lock-rotation",
                 "lock-rotation-prohibit-axis",
+                "lock-all-translations",
+                "lock-all-rotations",
+                "allow-self-intersection",
+                "allow-inter-object-intersection",
             ],
             "STATIC": [
                 "contact-gap",
                 "contact-offset",
                 "friction",
                 "soft-constraint",
+                "allow-self-intersection",
+                "allow-inter-object-intersection",
             ],
             "SAND": [
                 "sand-particle-mass",
@@ -375,6 +404,10 @@ def _encode_group_params(context, groups, state, fps, start_frame):
                 "lock-translation",
                 "lock-rotation",
                 "lock-rotation-prohibit-axis",
+                "lock-all-translations",
+                "lock-all-rotations",
+                "allow-self-intersection",
+                "allow-inter-object-intersection",
             ],
             "PDRD": [
                 "density",
@@ -391,6 +424,10 @@ def _encode_group_params(context, groups, state, fps, start_frame):
                 "lock-translation",
                 "lock-rotation",
                 "lock-rotation-prohibit-axis",
+                "lock-all-translations",
+                "lock-all-rotations",
+                "allow-self-intersection",
+                "allow-inter-object-intersection",
             ],
         }
         model_map = {
@@ -417,19 +454,12 @@ def _encode_group_params(context, groups, state, fps, start_frame):
             model = "PDRD"
         else:
             model = "N/A"
-        # strain_limit_percent is a percentage (UI); the solver wants the fraction.
-        strain_limit = (
-            np.float32(group.strain_limit_percent / 100.0)
-            if group.enable_strain_limit
-            else 0.0
+        # `to_solver_value` carries the percent-to-fraction conversion and both
+        # conditions that switch strain limiting off, so the static value, a
+        # sampled keyframe and a map target agree on all three.
+        strain_limit = np.float32(
+            _solver_value_or_zero(group, "strain-limit", group.strain_limit_percent)
         )
-        # Shrink/extend invalidates strain limiting: the strain-limit solver
-        # bakes the rest shape assuming unit scaling, so any shrink_x/y != 1
-        # makes the limit ill-defined. Silently disable to match the UI warning.
-        if group.object_type == "SHELL" and (
-            group.shrink_x != 1.0 or group.shrink_y != 1.0
-        ):
-            strain_limit = np.float32(0.0)
 
         if group.object_type == "SOLID":
             density = np.float32(group.solid_density)
@@ -459,14 +489,13 @@ def _encode_group_params(context, groups, state, fps, start_frame):
             poisson_ratio = np.float32(0.35)  # Default Poisson ratio for static
 
         # The solver consumes "young-mod" as a density-normalized value (Pa/rho).
-        # When the group's field is instead a true Young's modulus in pascals
-        # (young_mod_density_normalized off), normalize it here by dividing by
-        # density. When on (default), the field is already Pa/rho and is sent
-        # unchanged. density is guaranteed > 0 (UI min 0.01), so the division is
-        # safe. STATIC uses a fixed placeholder stiffness, so the flag does not
-        # apply there.
-        if group.object_type in ("SOLID", "SHELL", "ROD") and not group.young_mod_density_normalized:
-            young_modulus = np.float32(young_modulus / density)
+        # `to_solver_value` owns that conversion, so a map target and a sampled
+        # keyframe reach the solver in the same units this value does. PDRD and
+        # STATIC carry a placeholder stiffness and no density property, so the
+        # conversion leaves them alone.
+        young_modulus = np.float32(
+            _solver_value_or_zero(group, "young-mod", young_modulus)
+        )
 
         if group.object_type == "SAND":
             # A sand grain's physical radius IS its contact skin, so the grain
@@ -513,8 +542,6 @@ def _encode_group_params(context, groups, state, fps, start_frame):
                 for p in group.pin_vertex_groups
             )
         )
-        plasticity_on = group.enable_plasticity and not has_rest_shape_capture
-        bend_plasticity_on = group.enable_bend_plasticity and not has_rest_shape_capture
         if has_rest_shape_capture and (
             group.enable_plasticity or group.enable_bend_plasticity
         ):
@@ -547,15 +574,24 @@ def _encode_group_params(context, groups, state, fps, start_frame):
             # alone reaches the solver exactly as it did before.
             "bend-warp": np.float32(group.bend_warp),
             "bend-weft": np.float32(group.bend_weft),
+            # Intersection tolerances (issue #138). Float-encoded booleans,
+            # like bend-rest-from-geometry. They suppress REPORTING of the
+            # pairs they name at the scene-build check and at every solver
+            # intersection scan; no contact force and no CCD filter changes,
+            # so the solver still resolves what it can.
+            "allow-self-intersection": np.float32(
+                1.0 if group.allow_self_intersection else 0.0),
+            "allow-inter-object-intersection": np.float32(
+                1.0 if group.allow_inter_object_intersection else 0.0),
             "shrink": np.float32(group.shrink),
             "shrink-x": np.float32(group.shrink_x),
             "shrink-y": np.float32(group.shrink_y),
             "strain-limit": strain_limit,
-            "pressure": np.float32(group.inflate_pressure) if group.enable_inflate else np.float32(0.0),
-            "plasticity": np.float32(group.plasticity) if plasticity_on else np.float32(0.0),
-            "plasticity-threshold": np.float32(group.plasticity_threshold) if plasticity_on else np.float32(0.0),
-            "bend-plasticity": np.float32(group.bend_plasticity) if bend_plasticity_on else np.float32(0.0),
-            "bend-plasticity-threshold": np.float32(group.bend_plasticity_threshold) if bend_plasticity_on else np.float32(0.0),
+            "pressure": np.float32(_solver_value_or_zero(group, "pressure", group.inflate_pressure)),
+            "plasticity": np.float32(_solver_value_or_zero(group, "plasticity", group.plasticity)),
+            "plasticity-threshold": np.float32(_solver_value_or_zero(group, "plasticity-threshold", group.plasticity_threshold)),
+            "bend-plasticity": np.float32(_solver_value_or_zero(group, "bend-plasticity", group.bend_plasticity)),
+            "bend-plasticity-threshold": np.float32(_solver_value_or_zero(group, "bend-plasticity-threshold", group.bend_plasticity_threshold)),
             "bend-rest-from-geometry": np.float32(1.0 if group.bend_rest_angle_source == "FROM_GEOMETRY" else 0.0),
             "length-factor": np.float32(group.length_factor),
             # Per-object dicts key on UUID so the decoder looks up the
@@ -672,10 +708,29 @@ def _encode_group_params(context, groups, state, fps, start_frame):
             # Lock Translation: per-UUID normalized world-space axis (solver
             # space, direction only, no world scaling), set per assigned
             # object. Only enabled objects appear; the decoder turns each
-            # entry into an Object.lock_translation(*axis) call. Empty =
-            # every object stays free.
+            # entry into an Object.lock_translation(*axis) call. An
+            # all-axes lock names no axis and the axis encoder refuses a
+            # zero-length one, so such an object is OMITTED here and
+            # carried by "lock-all-translations" below: one lock state, one
+            # spelling on the wire. Empty therefore means no object is
+            # LINE-locked, which is not the same as no object being locked.
             "lock-translation": {
                 assigned.uuid: _encode_lock_translation_axis(assigned)
+                for assigned in group.assigned_objects
+                if assigned.included
+                and getattr(assigned, "lock_translation_enable", False)
+                and not getattr(assigned, "lock_translation_all", False)
+            },
+            # Lock All Translations: per-UUID bool, set for every
+            # translation-lock-enabled object. True pins the center of mass
+            # to its initial POINT (three rows) and is the only entry such
+            # an object has, since it appears in no axis dict; False is the
+            # line lock whose axis sits in "lock-translation" above. A mode
+            # rather than a direction, so it goes through neither the axis
+            # swap nor world scaling. Empty = no object in this group has
+            # Lock Translation enabled at all.
+            "lock-all-translations": {
+                assigned.uuid: bool(getattr(assigned, "lock_translation_all", False))
                 for assigned in group.assigned_objects
                 if assigned.included
                 and getattr(assigned, "lock_translation_enable", False)
@@ -685,24 +740,42 @@ def _encode_group_params(context, groups, state, fps, start_frame):
             # object. Independent of "lock-translation" above: an object
             # may appear in either dict, both, or neither. Only enabled
             # objects appear; the decoder turns each entry into an
-            # Object.lock_rotation(*axis) call. Empty = every object
-            # stays rotationally free.
+            # Object.lock_rotation(*axis) call. An all-axes lock is
+            # OMITTED here for the same reason it is omitted from
+            # "lock-translation", so empty means no object is locked to a
+            # single AXIS, not that every object rotates freely.
             "lock-rotation": {
                 assigned.uuid: _encode_lock_rotation_axis(assigned)
                 for assigned in group.assigned_objects
                 if assigned.included
                 and getattr(assigned, "lock_rotation_enable", False)
+                and not getattr(assigned, "lock_rotation_all", False)
             },
-            # Lock Rotation mode: per-UUID bool, set only for the same
-            # lock-rotation-enabled objects above. False (default) keeps
+            # Lock Rotation mode: per-UUID bool, set only for the objects
+            # that appear in "lock-rotation" above. False (default) keeps
             # the axis a whitelist (only rotation about it is allowed);
             # True flips it to a blacklist (rotation about it is
             # forbidden, the perpendicular plane stays free instead).
             # The decoder passes this to Object.lock_rotation alongside
-            # the axis from "lock-rotation". Empty = no rotation-locked
-            # objects, same emptiness condition as "lock-rotation".
+            # the axis from "lock-rotation", so an all-axes lock, which
+            # has no axis to pair with, is omitted from both.
             "lock-rotation-prohibit-axis": {
                 assigned.uuid: bool(assigned.lock_rotation_prohibit_axis)
+                for assigned in group.assigned_objects
+                if assigned.included
+                and getattr(assigned, "lock_rotation_enable", False)
+                and not getattr(assigned, "lock_rotation_all", False)
+            },
+            # Lock All Rotations: per-UUID bool, set for every
+            # rotation-lock-enabled object. True forbids net rotation about
+            # every axis (three rows) and is the only entry such an object
+            # has, appearing in neither "lock-rotation" nor its mode dict;
+            # False is one of the two per-axis modes those two carry. A mode
+            # rather than a direction, so it goes through neither the axis
+            # swap nor world scaling. Empty = no object in this group has
+            # Lock Rotation enabled at all.
+            "lock-all-rotations": {
+                assigned.uuid: bool(getattr(assigned, "lock_rotation_all", False))
                 for assigned in group.assigned_objects
                 if assigned.included
                 and getattr(assigned, "lock_rotation_enable", False)
@@ -786,18 +859,41 @@ def _build_param_dict(context) -> dict:
     start_frame = resolve_start_frame(state)
 
     # Evaluate the whole param tree at the starting frame, matching the data
-    # encoder (_build_obj_data). The per-group bounding-box diagonal that
-    # scales contact-gap / contact-offset reads live mesh state, so without
-    # this the fingerprint would track the artist's current timeline frame and
-    # drift from what the server stored at upload. The inner keyframe
-    # samplers (_encode_pin_config / _encode_dyn_params) save and restore
-    # their own frame, so nesting them here is safe.
+    # encoder (_build_obj_data). EVERY geometry-derived encoding below belongs
+    # inside this block, not only the per-group bounding-box diagonal that
+    # scales contact-gap / contact-offset: a material map's ATTRIBUTE source is
+    # read off the evaluated mesh, and an animated contact distance resolves
+    # that same diagonal per sample. Outside it, both would track the artist's
+    # current timeline frame and drift from what the server stored at upload.
+    # The inner keyframe samplers (_encode_pin_config / _encode_dyn_params /
+    # the F-curve samplers) save and restore their own frame, so nesting them
+    # here is safe.
     with evaluate_at_start_frame(context, state):
         scene_params = _encode_scene_params(context, state, fps)
         group_params = _encode_group_params(context, groups, state, fps, start_frame)
         pin_config = _encode_pin_config(context, groups, state, fps, start_frame)
         cross_stitch = _encode_cross_stitch(context)
+        # Scene settings the artist keyframed, sampled from their own
+        # F-curves. This is the authoring path; `_encode_dyn_params` reads the
+        # addon's legacy keyframe list and stays only until every saved scene
+        # has been migrated off it. A key present in both is taken from the
+        # F-curve, because that is the one the artist can see on the timeline.
         dyn_param = _encode_dyn_params(state, fps, start_frame)
+        dyn_param.update(
+            encode_scene_param_anim(state, fps, start_frame, int(state.frame_count))
+        )
+        # Material sliders the artist keyframed, sampled across the solve's
+        # frame range. Times are shared by the whole scene so the solver reads
+        # one times.bin; the per-group values ride along with that group's
+        # params. The maps are encoded first: a map keyed over time needs its
+        # own times represented on the shared keyframe axis, which
+        # `encode_param_anim` picks.
+        spatial, map_schedules = encode_material_maps(
+            context, groups, fps, start_frame
+        )
+        anim_times, anim_by_group = encode_param_anim(
+            state, groups, fps, start_frame, int(state.frame_count), map_schedules
+        )
 
     result = {
         "scene": scene_params,
@@ -814,6 +910,30 @@ def _build_param_dict(context) -> dict:
         result["cross_stitch"] = cross_stitch
     if dyn_param:
         result["dyn_param"] = dyn_param
+
+    if anim_times:
+        result["param_anim_times"] = anim_times
+        # `_encode_group_params` appends exactly one entry per group with no
+        # skips, so the two lists are positionally aligned; zip rather than a
+        # uuid lookup keeps that assumption in one place, and the assert makes
+        # it fail loudly if a skip is ever added.
+        assert len(group_params) == len(groups), (
+            f"group_params has {len(group_params)} entries for {len(groups)} "
+            "groups; the animated-material attach below assumes one each"
+        )
+        for group, (params_dict, _objects, _uuids) in zip(groups, group_params):
+            series = anim_by_group.get(group.uuid)
+            if series:
+                params_dict["param-anim"] = series
+    # Spatial material maps, attached to their group the same way the animated
+    # schedules are. Per object inside, because the weights are per vertex and
+    # a group can hold several objects.
+    if spatial:
+        for group, (params_dict, _objects, _uuids) in zip(groups, group_params):
+            series = spatial.get(group.uuid)
+            if series:
+                params_dict["material-maps"] = series
+
     ic = _encode_invisible_colliders(state, fps, start_frame)
     if ic:
         result["invisible_colliders"] = ic

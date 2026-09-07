@@ -238,18 +238,32 @@ fn main() {
             .collect();
 
         // Step 2: Sequential deduplication
+        let animated_materials = props.animated_materials;
         for (length, param) in non_rod_edge_data {
-            let param_idx = *edge_param_map.entry(param).or_insert_with(|| {
-                let new_idx = props.edge_params.len() as u32;
+            // Identity indices for an animated scene, matching every other
+            // param table: the per-frame path rewrites these values, and a
+            // deduplicated table would renumber underneath the param_index
+            // stored on each EdgeProp below.
+            let param_idx = if animated_materials {
                 props.edge_params.push(param);
-                new_idx
-            });
+                (props.edge_params.len() - 1) as u32
+            } else {
+                *edge_param_map.entry(param).or_insert_with(|| {
+                    let new_idx = props.edge_params.len() as u32;
+                    props.edge_params.push(param);
+                    new_idx
+                })
+            };
             props.edge.push(EdgeProp {
                 length,
                 initial_length: length,
                 mass: 0.0,
                 fixed: false,
                 param_index: param_idx,
+                // Both `fixed` and this are derived in builder::build, which
+                // runs after these face edges have been appended, so it sees
+                // the full edge list.
+                pin_allow_intersection: false,
             });
         }
 
@@ -278,6 +292,7 @@ fn main() {
         };
         let lock_data = builder::LockSceneData {
             translation_axes: scene.translation_locks(),
+            translation_modes: scene.translation_lock_modes(),
             rotation_axes: scene.rotation_locks(),
             rotation_modes: scene.rotation_lock_modes(),
             vert_dmap: scene.vert_dmap(),

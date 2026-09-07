@@ -384,7 +384,40 @@ pub struct VertexProp {
     /// held by springs and its vertices become free. Field order must mirror
     /// `VertexProp` in `cpp/data.hpp` (repr(C) ABI).
     pub collider: bool,
+    /// Source-object identity, the only thing that separates a SELF-
+    /// intersection from an INTER-OBJECT one. `param_index` cannot serve:
+    /// identical materials deduplicate to one entry, so two objects share it.
+    /// Read off an element's FIRST vertex, the convention `pdrd_body_index`
+    /// and `collider` already use, which holds because a vertex belongs to
+    /// exactly one object and therefore so does every element built on it.
+    /// `NO_OBJECT_INDEX` when the session directory carries no
+    /// `object_vert.bin`. Field order must mirror `VertexProp` in
+    /// `cpp/data.hpp` (repr(C) ABI).
+    pub object_index: u32,
+    /// This vertex's object's intersection tolerances, as
+    /// `INTERSECT_ALLOW_SELF | INTERSECT_ALLOW_INTER_OBJECT`. Resolved per
+    /// OBJECT by the frontend rather than per element, which is both the
+    /// granularity the material param actually has and the only one defined
+    /// for a faceless SAND grain (no incident element to read a material
+    /// from).
+    pub intersect_policy: u8,
+    /// Every pin covering this vertex asked for its intersections to be
+    /// tolerated. False for an unpinned vertex, so an element earns the
+    /// exemption only when ALL of its vertices carry this. Latched at scene
+    /// build from the initial constraint set, exactly like `FaceProp::fixed`;
+    /// a pin that later reaches its unpin time does not take it back.
+    pub pin_allow_intersection: bool,
 }
+
+/// `VertexProp::object_index` for a vertex whose source object is unknown,
+/// which is what a session directory written before `object_vert.bin` gives.
+/// Deliberately not 0: two unknown indices must not compare equal, or every
+/// such pair would read as a self-intersection and take that allowance.
+pub const NO_OBJECT_INDEX: u32 = u32::MAX;
+
+/// `VertexProp::intersect_policy` bits. Mirrored in `cpp/data.hpp`.
+pub const INTERSECT_ALLOW_SELF: u8 = 1 << 0;
+pub const INTERSECT_ALLOW_INTER_OBJECT: u8 = 1 << 1;
 
 #[repr(C)]
 #[derive(Serialize, Deserialize, Clone, Copy, Default)]
@@ -394,6 +427,12 @@ pub struct EdgeProp {
     pub mass: f32,
     pub fixed: bool,
     pub param_index: u32,
+    /// All of this edge's vertices are pinned by pins that asked for their
+    /// intersections to be tolerated. Precomputed from
+    /// `VertexProp::pin_allow_intersection` the same way `fixed` is
+    /// precomputed from `fix_index`, and carrying the same build-time-snapshot
+    /// caveat. Field order must mirror `EdgeProp` in `cpp/data.hpp`.
+    pub pin_allow_intersection: bool,
 }
 
 #[repr(C)]
@@ -417,6 +456,9 @@ pub struct FaceProp {
     /// the three alias. Field order must mirror `FaceProp` in `cpp/data.hpp`.
     pub collider: bool,
     pub param_index: u32,
+    /// All of this face's vertices are pinned by pins that asked for their
+    /// intersections to be tolerated. See `EdgeProp::pin_allow_intersection`.
+    pub pin_allow_intersection: bool,
 }
 
 #[repr(C)]
@@ -644,6 +686,11 @@ pub struct FixPair {
     pub ghat: f32,
     pub index: u32,
     pub kinematic: bool,
+    /// The pin that placed this vertex asked for its intersections to be
+    /// tolerated. Consumed once, at scene build, to latch
+    /// `VertexProp::pin_allow_intersection`; the solver's per-step constraint
+    /// rebuild carries it along so the two constructions cannot disagree.
+    pub allow_intersection: bool,
     // NOTE: every fix pin is an exact Dirichlet BC (the solver eliminates its
     // DOF), so there is no per-pin stiffness to scale: there is no penalty force
     // left. `ghat` and `kinematic` survive only for the PDRD anchor, the one pin
@@ -657,6 +704,11 @@ pub struct PullPair {
     pub position: Vec3f,
     pub weight: f32,
     pub index: u32,
+    /// See `FixPair::allow_intersection`. A pull pin holds its vertex only to
+    /// the extent of its own force, so an intersection under one is often not
+    /// something the pin is responsible for; that is the case issue #138
+    /// singles out.
+    pub allow_intersection: bool,
 }
 
 #[repr(C)]
@@ -787,6 +839,24 @@ pub struct Constraint {
 /// `DataSet::inv_rest2x2` / `inv_rest3x3`, which the elastic kernels re-read
 /// each Newton iteration. Field order must mirror `RestShapeUpdate` in
 /// `cpp/data.hpp` (repr(C) ABI).
+/// Per-frame material tables, uploaded before `advance` exactly as
+/// `RestShapeUpdate` is. Only the face table varies today; the hinge, edge and
+/// vertex tables are derived from the faces at build and animating them needs
+/// that derivation re-run, which `FACE_ONLY_ANIM_KEYS` refuses until it exists.
+///
+/// Field order must mirror `MaterialParamUpdate` in `cpp/data.hpp` (repr(C)).
+#[repr(C)]
+pub struct MaterialParamUpdate {
+    pub face: CVec<FaceParam>,
+    /// Derived from the faces: a vertex or edge averages its neighbors and a
+    /// hinge averages its two faces, so a frame that moves the faces moves
+    /// these too. Uploading the faces alone would animate the membrane while
+    /// the hinges held their build-time stiffness.
+    pub vertex: CVec<VertexParam>,
+    pub edge: CVec<EdgeParam>,
+    pub hinge: CVec<HingeParam>,
+}
+
 #[repr(C)]
 #[derive(Serialize, Deserialize)]
 pub struct RestShapeUpdate {
@@ -916,24 +986,46 @@ pub struct VertexSet {
     pub curr: CVec<Vec3f>,
 }
 
-/// One enabled aggregate rigid-mode lock. `axis` is the optional unit
-/// translation direction and `rotation_axis` is the optional unit rotation
-/// direction, both in solver space. A zero axis disables that part of the
-/// lock. Translation constrains the physical mass-weighted center of mass to
-/// the line through its initial value. Rotation constrains each Newton
-/// correction's best-fit infinitesimal angular increment to its axis.
+/// One enabled aggregate rigid-mode lock. Translation constrains the physical
+/// mass-weighted center of mass, and rotation constrains each Newton
+/// correction's best-fit infinitesimal angular increment. The two are
+/// independent: either, both, or neither may be enabled on one group.
+///
+/// Each half is described by a mode beside an axis, and THE MODE CARRIES THE
+/// ENABLE BIT. In an axis mode the axis is a unit solver-space direction and a
+/// zero axis means that half is off; in an all-axes mode the axis is
+/// meaningless and is required to be exactly zero, so a record has one
+/// canonical spelling. `builder.rs` asserts that biconditional. Reading
+/// enablement off the axis alone is therefore wrong for the all-axes modes,
+/// which is why both backends test through their own
+/// `translation_lock_enabled` / `rotation_lock_enabled` helpers.
+///
+/// | mode | rows | meaning |
+/// | ---- | ---- | ------- |
+/// | `TRANSLATION_LOCK_AXIS` | 2 | the center of mass stays on the line through its initial value along `axis` |
+/// | `TRANSLATION_LOCK_ALL` | 3 | the center of mass stays at its initial point |
+/// | `ROTATION_LOCK_ALLOW_ONLY` | 2 | rotation about `rotation_axis` is the only angular freedom |
+/// | `ROTATION_LOCK_PROHIBIT_AXIS` | 1 | rotation about `rotation_axis` is forbidden, the perpendicular plane stays free |
+/// | `ROTATION_LOCK_ALL` | 3 | there is no net rotation about any axis |
+///
+/// Zero is the off value for both modes, so a session written without the lock
+/// bins decodes to an unlocked scene rather than a malformed one.
 ///
 /// `pdrd_body_index` is 0 for a deformable/SAND group and otherwise the
 /// 1-based PDRD body that owns this lock. `anchor` is one locked initial
-/// position used to form all current relative coordinates. Field order must
-/// mirror `TranslationLock` in `cpp/data.hpp` (repr(C) ABI).
+/// position used to form all current relative coordinates. Field order must mirror `TranslationLock` in
+/// `cpp/data.hpp` (repr(C) ABI).
+pub const TRANSLATION_LOCK_AXIS: u32 = 0;
+pub const TRANSLATION_LOCK_ALL: u32 = 1;
 pub const ROTATION_LOCK_ALLOW_ONLY: u32 = 0;
 pub const ROTATION_LOCK_PROHIBIT_AXIS: u32 = 1;
+pub const ROTATION_LOCK_ALL: u32 = 2;
 
 #[repr(C)]
 #[derive(Serialize, Deserialize, Clone, Copy, Default)]
 pub struct TranslationLock {
     pub axis: Vec3f,
+    pub translation_mode: u32,
     pub total_mass: f32,
     pub pdrd_body_index: u32,
     pub dmap_index: u32,
@@ -941,6 +1033,15 @@ pub struct TranslationLock {
     pub rotation_mode: u32,
     pub anchor: Vec3f,
 }
+
+// The record is memcpy'd raw into device memory, and nothing else compares
+// this layout against its C++ mirror. A field added on one side only would
+// reinterpret the fields after it and still compile clean on both sides.
+// `cpp/data.hpp` asserts the same number.
+const _: () = assert!(
+    std::mem::size_of::<TranslationLock>() == 56,
+    "TranslationLock must stay layout-identical to its mirror in cpp/data.hpp"
+);
 
 #[repr(C)]
 #[derive(Serialize, Deserialize)]

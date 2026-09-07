@@ -163,7 +163,24 @@ try:
         if getattr(prop, "is_readonly", False):
             continue
         all_scalar.append(prop.identifier)
-    all_scalar = sorted(set(all_scalar) - {"object_type"})
+    # `lock_*` is held OFF on both groups for the same reason `object_type` is
+    # held stable: a lock is a paste FILTER, so seeding one would make this
+    # scenario's premise (every non-excluded field transfers) false by design
+    # rather than by defect. That the filter works is covered by
+    # bl_material_lock_guards.
+    # From the authoritative list, not a `lock_` prefix match: the group also
+    # carries `lock_translation_object_selection`, an enum, and a prefix guess
+    # would try to write False into it.
+    locks_mod = __import__(pkg + ".models.material_locks",
+                           fromlist=["LOCKABLE_MATERIAL_PROPS", "lock_name"])
+    locks = sorted(
+        locks_mod.lock_name(n) for n in locks_mod.LOCKABLE_MATERIAL_PROPS
+    )
+    locks = [n for n in locks if n in all_scalar]
+    for name in locks:
+        setattr(a, name, False)
+        setattr(b, name, False)
+    all_scalar = sorted(set(all_scalar) - {"object_type"} - set(locks))
 
     excluded = set(introspect.MATERIAL_CLIPBOARD_EXCLUDE)
     copyable = sorted(set(introspect.list_copyable_params(

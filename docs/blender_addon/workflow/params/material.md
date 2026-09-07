@@ -174,6 +174,8 @@ These apply regardless of type.
 | **Use Group Bounding Box Diagonal**  | `use_group_bounding_box_diagonal` | `True`  | When true, contact distances are ratios of the group's bbox diagonal.    |
 | **Contact Gap Ratio**                | `contact_gap_rat`                 | 0.001   | Contact gap as a fraction of the group's bounding-box diagonal.          |
 | **Contact Offset Ratio**             | `contact_offset_rat`              | 0.0     | Contact offset as a fraction of the group's bounding-box diagonal.       |
+| **Allow Self-Intersections**         | `allow_self_intersection`         | `False` | Accept a mesh that overlaps itself instead of stopping the run.          |
+| **Allow Inter-Object Intersections** | `allow_inter_object_intersection` | `False` | Accept an overlap against a different mesh instead of stopping the run.  |
 
 **Friction at a contact** is asymmetric in the material parameters
 but symmetric in the solve: each object carries its own **Friction**
@@ -198,7 +200,8 @@ the safest choice when you have not set per-object friction values
 deliberately.
 
 See [Contact gap: absolute vs ratio](#contact-gap-absolute-vs-ratio) below
-for which pair you should be editing.
+for which pair you should be editing, and
+[Allow Intersections](#allow-intersections) for the last two rows.
 
 ## Rayleigh Damping
 
@@ -916,6 +919,107 @@ matching against another group.
 Both pairs (**Contact Gap** / **Contact Gap Ratio** and **Contact
 Offset** / **Contact Offset Ratio**) are independently controlled by
 the same toggle.
+
+## Allow Intersections
+
+A simulation does not start on geometry that is already overlapping. The
+scene build counts the overlapping pairs and reports them instead of
+finishing, and the solver runs its own intersection test as it goes, so an
+overlap that appears part way through a bake ends the run there.
+
+Every group carries two settings that accept an overlap instead of refusing
+it. They sit in an **Allow Intersections** box at the bottom of the group's
+**Material Params**, and both are off by default. Each one applies to every
+object assigned to the group.
+
+- **Allow Self-Intersections**: a mesh in this group may overlap itself. Use
+  it for a sleeve folded through its own cuff, or a collar that passes into
+  the shoulder in the pose the mesh arrives in.
+- **Allow Inter-Object Intersections**: a mesh in this group may overlap a
+  different mesh, including another mesh assigned to this same group.
+
+Both are drawn for every group type, **Static** included, though on a
+**Static** group whether they take effect depends on how the collider is
+driven (see below).
+With either one on, the panel adds the line "Overlaps are simulated, not
+reported" beneath the checkboxes.
+
+:::{important}
+These settings suppress the error, not the collision. The two surfaces are
+still in contact, the solver still pushes them apart, and any overlap you
+did not allow is still reported. What changes is that the run starts, and
+keeps going, through the overlaps you allowed.
+:::
+
+### Only One Side Has to Allow It
+
+An overlap between two meshes is accepted when **either** of them has
+**Allow Inter-Object Intersections** on. Turn it on for a garment and every
+pair the garment forms with a different mesh is accepted, including the pair
+with the character body it is fitted to, so you do not have to find each mesh
+the garment might reach and set it there too. The garment's overlaps with
+itself are a separate question, answered by **Allow Self-Intersections**.
+
+Set it on the group that is simulated. A **Static** collider counts as
+simulated, and carries both settings, when it is animated, when it uses
+**Apply Soft Constraints**, or when it is one end of a cross-stitch. A
+collider that is none of those never moves and is a collision surface only:
+neither box on its group has any effect, so a garment overlapping it needs
+**Allow Inter-Object Intersections** on the garment's own group. That is the
+safe habit in every case, since it does not depend on how the collider is
+driven.
+
+### The Two Settings Do Not Substitute for Each Other
+
+**Allow Self-Intersections** says nothing about other meshes, and **Allow
+Inter-Object Intersections** says nothing about a mesh folding through
+itself. A group with only the first still stops on an overlap against
+another mesh; a group with only the second still stops on a fold through
+itself. Turn both on where both can happen.
+
+"Self" here means one mesh object, not one group. A group holding two meshes
+holds two objects, so an overlap between those two is an inter-object
+overlap even though a single group covers both.
+
+### When to Use Them
+
+The case these exist for is a garment fitted onto a rig-deformed character.
+The fitted pose is whatever the rig produced, tangles included: a cuff that
+starts inside a wrist, an armpit that folds a sleeve into the torso. The
+simulation is expected to resolve that over the first frames, and without an
+allowance it never runs at all, because the start pose is refused before the
+first frame is solved.
+
+They are not a general repair for messy geometry. An overlap the solver
+cannot resolve stays in place for the whole bake, and geometry that starts
+deeply inside another mesh keeps showing through it until it separates, if it
+separates at all. Fix the geometry wherever you can instead: see
+[Mesh Cleaning](../scene/mesh_cleaning.md).
+
+Where the problem is confined to a region you have pinned, the per-pin
+[Allow Intersections Here](../constraints/pins.md#allow-intersections-here)
+option is narrower than either group setting.
+
+:::{admonition} Under the hood
+:class: toggle
+
+The check at scene build and the check the solver runs while it steps are
+separate pieces of code, and both consult the allowance, so a scene that
+builds is not then stopped by the first step. It is evaluated per overlapping
+pair of elements, whether that is two triangles, a rod segment against a
+triangle or against another rod segment, or two grains of a Sand cloud, and
+it decides one thing: whether that pair is reported.
+
+The other geometry checks are unrelated and are not lifted by these
+settings. In particular, a start pose whose elements are closer than their
+contact offset is still rejected as too close, which is a different report
+from an intersection.
+
+Contact forces, the continuous-collision test, and the line search that
+enforces separation are all untouched. Two surfaces that are apart at the
+start of a step still cannot pass through each other during it, whatever
+these settings say.
+:::
 
 ## Material Profiles
 

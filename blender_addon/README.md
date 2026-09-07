@@ -337,12 +337,12 @@ State is split across three files for maintainability:
 | `port` | IntProperty | 22 | SSH port |
 | `username` | StringProperty | "" | SSH username |
 | `key_path` | StringProperty (FILE_PATH) | "~/.ssh/id_ed25519" or "~/.ssh/id_rsa" | SSH key |
-| `docker_path` | StringProperty | "/root/ppf-contact-solver" | Container working path |
-| `local_path` | StringProperty | "~/ppf-contact-solver" | Local solver path |
+| `docker_path` | StringProperty | "/root/ppf-contact-solver" | Container working path, where the published image puts the solver |
+| `local_path` | StringProperty (DIR_PATH) | "" | Local solver path |
 | `server_type` | EnumProperty | "CUSTOM" | LOCAL/CUSTOM/COMMAND/DOCKER/DOCKER_SSH/DOCKER_SSH_COMMAND/WIN_NATIVE |
 | `command` | StringProperty | "ssh -p xxx root@zzz" | SSH command string |
-| `container` | StringProperty | "ppf-dev" | Docker container name |
-| `ssh_remote_path` | StringProperty | "/root/ppf-contact-solver" | Remote solver path |
+| `container` | StringProperty | "ppf-contact-solver" | Docker container name, as the README `docker run --name` creates it |
+| `ssh_remote_path` | StringProperty | "" | Remote solver path |
 | `win_native_path` | StringProperty (DIR_PATH) | "" | Windows solver root |
 | `docker_port` | IntProperty | 9090 | Server port (min 1024, max 65535) |
 

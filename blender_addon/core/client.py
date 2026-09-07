@@ -24,6 +24,7 @@ from ..models.groups import get_addon_data, iterate_active_object_groups
 from .facade import communicator, engine
 from .pc2 import (
     append_pc2_frame,
+    cache_placement_is_stale,
     clear_gap_tracking,
     create_pc2_file,
     ensure_curve_handler,
@@ -669,6 +670,8 @@ def heal_mesh_caches_if_stale():
 
       * no modifier    → create it and point it at the PC2
       * broken modifier (cache_format != PC2 or empty filepath) → rebind
+      * modifier placed above a deformer it has to follow → re-place
+        (see :func:`cache_placement_is_stale`)
       * vertex count mismatch between live mesh and PC2 → skip (the next
         fresh frame arrival will delete the stale PC2 and start over)
 
@@ -731,6 +734,21 @@ def heal_mesh_caches_if_stale():
                     # the helper, so the common frame-1 scene never pays the
                     # fcurve walk.
                     or needs_cache_visibility_keys(obj, heal_frame_start)
+                    # The cache sits at whatever index it was BOUND at, and
+                    # a bind only happens when no PC2 exists yet, so a stack
+                    # that gains a deformer after a solve keeps the cache
+                    # above it and re-deforms the solver output on top of
+                    # itself. Nothing else re-places it: a re-run appends to
+                    # the PC2 already on disk instead of rebinding. Gated
+                    # on the stack holding more than the cache itself: a
+                    # lone cache has only one possible index, so the common
+                    # case pays no deformer scan.
+                    or (
+                        len(obj.modifiers) > 1
+                        and cache_placement_is_stale(
+                            obj, _needs_after_deformers(g.object_type, obj)
+                        )
+                    )
                 )
                 if not needs_setup:
                     continue

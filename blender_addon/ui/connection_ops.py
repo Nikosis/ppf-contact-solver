@@ -16,7 +16,14 @@ from ..core.async_op import AsyncOperator
 from ..core.client import communicator as com
 from ..core.module import module_exists
 from ..core.ssh_command import parse_ssh_command
-from ..core.utils import find_invalid_name_char, find_invalid_path_char, get_timer_wait_time, redraw_all_areas
+from ..core.utils import (
+    find_invalid_name_char,
+    find_invalid_path_char,
+    find_shell_unsafe_path_char,
+    get_timer_wait_time,
+    redraw_all_areas,
+    resolve_local_path,
+)
 from ..models.groups import get_addon_data
 
 
@@ -34,9 +41,17 @@ def _refresh_ssh_panel_bridge():
 class REMOTE_OT_Connect(Operator):
     """Establish an SSH connection and execute a command asynchronously.
 
-    Note: This operator intentionally does NOT use AsyncOperator because it
-    stays alive for the entire connection lifetime (refreshing the SSH
-    panel each tick) and only finishes when disconnected.
+    Note: This operator intentionally does NOT use AsyncOperator because
+    its modal covers only the handshake: it polls until the connection is
+    up, fails, or times out, then finishes.
+
+    It must NOT stay alive for the connection's lifetime. Blender skips
+    its auto-save for as long as any modal operator handler is attached to
+    a window, re-arming the auto-save timer every 10 ms instead of
+    writing, so a modal held open across a working session leaves the
+    user with no recovery file at all. Watching for the disconnect and
+    refreshing the SSH panel need no modal context, since both only tag a
+    redraw, and run from the persistent tick in ``core.facade`` instead.
     """
 
     bl_idname = "ssh.run_command"
@@ -48,8 +63,17 @@ class REMOTE_OT_Connect(Operator):
     timeout: float = 60.0
 
     def get_remote_path(self, props):
+        """Return the solver directory for the selected connection type.
+
+        ``LOCAL`` names a directory on the machine Blender runs on, so it goes
+        through ``resolve_local_path``: the picker stores it in Blender's
+        ``//``-relative notation whenever the .blend is saved and relative
+        paths are enabled, and ``os.path`` cannot read that form. The SSH and
+        Docker paths name a directory on the solver host, where the client's
+        .blend location has no meaning, so they are returned verbatim.
+        """
         if props.server_type == "LOCAL":
-            return props.local_path
+            return resolve_local_path(props.local_path)
         elif props.server_type in ["CUSTOM", "COMMAND"]:
             return props.ssh_remote_path
         else:
@@ -83,11 +107,17 @@ class REMOTE_OT_Connect(Operator):
                 and project_name_valid
             )
         elif props.server_type == "DOCKER":
+            # Local Docker reaches the daemon over the Docker socket, so no
+            # SSH key takes part in the connection and the panel does not draw
+            # the SSH Key field in this mode. Gating the button on that field
+            # made the button unpressable for a reason nothing on screen could
+            # explain: the default key path is derived from the user's home
+            # directory, so a Windows account whose name holds a space put a
+            # space in it, and the shell-safety test rejected a value the user
+            # could neither see nor edit here.
             return (
                 not com.is_connected()
                 and props.container.strip() != ""
-                and props.key_path.strip() != ""
-                and find_invalid_path_char(props.key_path) is None
                 and find_invalid_path_char(props.docker_path) is None
                 and module_exists(["docker"])
                 and project_name_valid
@@ -112,10 +142,16 @@ class REMOTE_OT_Connect(Operator):
                 and project_name_valid
             )
         elif props.server_type == "WIN_NATIVE":
+            # The Windows Native root never reaches a shell (it is an
+            # os.path.join base, a Popen argv element, and that Popen's cwd),
+            # so it is held to the metacharacter rule only. A space is
+            # ordinary in a Windows path, and this button is the only place
+            # the user could act on a refusal of one, with no field on screen
+            # to change and nothing wrong with what they picked.
             return (
                 not com.is_connected()
                 and props.win_native_path.strip() != ""
-                and find_invalid_path_char(props.win_native_path) is None
+                and find_shell_unsafe_path_char(props.win_native_path) is None
                 and project_name_valid
             )
         elif props.server_type == "LOCAL":
@@ -191,7 +227,7 @@ class REMOTE_OT_Connect(Operator):
                 server_port=props.docker_port,
             )
         elif props.server_type == "WIN_NATIVE":
-            win_path = props.win_native_path.strip()
+            win_path = resolve_local_path(props.win_native_path)
             if not win_path:
                 self.report({"ERROR"}, iface_("Solver path is not set"))
                 return {"CANCELLED"}
@@ -210,37 +246,35 @@ class REMOTE_OT_Connect(Operator):
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
+    def _detach_timer(self, context):
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+
     def modal(self, context, event):
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
         # Check is_connected() before the cancel/timeout branches: a fast connect
         # (e.g., LOCAL) can reach ONLINE before the first timer tick, which would
         # otherwise be misread as a cancellation since is_connecting() is False.
-        if com.is_connected() and not self._connection_established:
+        if com.is_connected():
             self._connection_established = True
+            self._detach_timer(context)
             redraw_all_areas(context)
-        # Detect cancellation (user canceled or connection failed)
-        if not self._connection_established and not com.is_connecting():
-            if self._timer:
-                context.window_manager.event_timer_remove(self._timer)
-                self._timer = None
+            return {"FINISHED"}
+        # Detect cancellation (user canceled or connection failed). Reaching
+        # here means the connection is not up, so the established flag can
+        # only be False and does not need testing.
+        if not com.is_connecting():
+            self._detach_timer(context)
             return {"CANCELLED"}
-        # Timeout only applies before connection is established
-        if (
-            not self._connection_established
-            and time.time() - self._start_time > self.timeout
-        ):
-            if self._timer:
-                context.window_manager.event_timer_remove(self._timer)
-                self._timer = None
+        # Still handshaking, so the timeout applies on every tick that
+        # gets this far.
+        if time.time() - self._start_time > self.timeout:
+            self._detach_timer(context)
             self.report({"ERROR"}, iface_("Connection timed out"))
             return {"CANCELLED"}
         _refresh_ssh_panel_bridge()
-        if self._connection_established and not com.is_connected():
-            if self._timer:
-                context.window_manager.event_timer_remove(self._timer)
-                self._timer = None
-            return {"FINISHED"}
         return {"PASS_THROUGH"}
 
 

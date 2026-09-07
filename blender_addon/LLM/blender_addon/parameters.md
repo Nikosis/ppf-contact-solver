@@ -274,6 +274,8 @@ Every object group carries its own copy of the full material-parameter set, but 
 - **Sand**: a granular body of loose grain-center vertices. Only grain radius (locked at conversion), particle mass, an inter-grain friction, and a contact gap. See Sand-specific below, including how a mesh becomes a Sand body.
 - **Static**: friction, contact settings, and **Apply Soft Constraints** (static objects have no deformation to tune). See Static Objects for the full treatment of Static groups, including how to animate them.
 
+Every group type additionally carries **Allow Self-Intersections** and **Allow Inter-Object Intersections** (see Allow Intersections below).
+
 Rows that don't apply to the current type are hidden in the UI.
 
 The six options in the group-type dropdown on each group's header row. Picking one changes the Material Params box to match: Solid shows density, stiffness, and a single shrink factor; Shell shows the full cloth stack including anisotropic shrink, strain limit, inflate, and stitch; Rod shows density, stiffness, a Shrink rest-length scale, bend, and strain limit; PDRD shows its rigid-body density, an optional hinge joint, plus shared contact rows; Sand shows a read-only grain radius, particle mass, friction, and a contact gap; Static collapses to Friction, **Apply Soft Constraints**, and the contact rows.
@@ -460,6 +462,42 @@ What it does: each coefficient `β` (seconds) adds a damping term `(β/Δt)·K` 
 When to enable: calming jitter or ringing on stiff cloth, rods, or solids without globally raising air damping. Leave at `0.0` for fully elastic motion.
 
 Bending-CFL caveat: bending damping adds a stiffness term that tightens the explicit step-size stability bound on fine meshes. On a heavily subdivided shell or rod, a large **Bending Damping** value can force a smaller **Step Size** to stay stable; raise it gradually and watch for the solver needing a smaller step.
+
+#### Allow Intersections
+
+Two per-group checkboxes at the bottom of the Material Params stack, both
+defaulting to off:
+
+| UI label                            | Python / TOML key                  | Default | Applies to      | Description                                                                 |
+| ----------------------------------- | ---------------------------------- | ------- | --------------- | --------------------------------------------------------------------------- |
+| **Allow Self-Intersections**        | `allow_self_intersection`          | off     | every group type | Accept an overlap of an object with ITSELF instead of stopping the run.      |
+| **Allow Inter-Object Intersections**| `allow_inter_object_intersection`  | off     | every group type | Accept an overlap between two DIFFERENT objects instead of stopping the run. |
+
+What they do: they suppress the intersection REPORT for the pairs they name, at
+the scene-build check and at the solver's own check alike. Contact, CCD and the
+line search are unchanged, so the solver still pushes on the overlap; what the
+setting buys is that a run starts and keeps going instead of being refused.
+
+Granularity: the value is applied to every object assigned to the group, and
+self versus inter-object is decided per Blender OBJECT, not per group. Two
+meshes assigned to the same group form an INTER-OBJECT pair, so
+**Allow Self-Intersections** does not cover an overlap between them.
+
+Either side is enough for the inter-object key, so setting it on a garment also
+covers the pair it forms with the character body it is fitted to.
+
+On a **Static** group both keys reach the solver whenever the collider is part
+of the solved scene: animated, using **Apply Soft Constraints**, or named as one
+end of a cross-stitch. A collider that is none of those is a collision surface
+only and neither box on its group has any effect.
+
+When to enable: geometry that arrives tangled in some poses and is expected to be
+sorted out by the simulation, most often a garment pinned to a rig-deformed
+character. Leave both off otherwise: an intersection you did not expect is worth
+being told about.
+
+A related per-pin checkbox, **Allow Intersections Here**, covers only the
+elements a single pin holds completely. See Constraints for it.
 
 #### Velocity Overwrite
 

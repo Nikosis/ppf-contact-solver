@@ -20,6 +20,8 @@ from ...models.groups import (
 )
 from ..state import iterate_active_object_groups
 from .utils import get_assigned_by_selection_uuid
+from ...models.material_locks import is_locked, lock_name
+from ...models.material_maps import wants_anisotropic_bending
 
 
 # Cache `os.path.isfile(bpy.path.abspath(path))` per unique path string.
@@ -113,18 +115,31 @@ def _draw_lock_translation(param_box, group, actual_index):
     world-space line (Lock Translation) and, independently, its
     mass-weighted best-fit rigid rotation can be restricted about a
     fixed world-space axis (Lock Rotation), while deformation stays
-    free in both cases. Lock Rotation itself has two modes, toggled by
-    `lock_rotation_prohibit_axis`: unchecked (default) allows rotation
+    free in both cases. Lock Rotation itself has two axis modes, toggled
+    by `lock_rotation_prohibit_axis`: unchecked (default) allows rotation
     about the axis only; checked forbids rotation about the axis and
-    frees the perpendicular rotation plane instead. The lock checkboxes
-    are independent booleans on the same AssignedObject: either, both,
-    or neither of Lock Translation / Lock Rotation may be enabled. Per
-    object (like the PDRD Hinge box above), since one group can hold
-    several bodies, each locked to its own axis or axes: an expandable
-    box with a single object picker shared by both locks rather than
-    one group-wide toggle. Available for every dynamic type (SOLID,
-    SHELL, ROD, PDRD, SAND). The eye toggle previews every enabled
-    axis, translation and rotation alike, for the whole group.
+    frees the perpendicular rotation plane instead. Either lock can also
+    saturate: `lock_translation_all` pins the center of mass to a point
+    and `lock_rotation_all` forbids rotation about every axis, and in
+    both cases the axis below it stops meaning anything. The lock
+    checkboxes are independent booleans on the same AssignedObject:
+    either, both, or neither of Lock Translation / Lock Rotation may be
+    enabled. Per object (like the PDRD Hinge box above), since one group
+    can hold several bodies, each locked to its own axis or axes: an
+    expandable box with a single object picker shared by both locks
+    rather than one group-wide toggle. Available for every dynamic type
+    (SOLID, SHELL, ROD, PDRD, SAND). The eye toggle previews every
+    enabled lock, translation and rotation alike, for the whole group.
+
+    Two idioms are mixed here on purpose. The enable checkbox HIDES the
+    controls under it, the surrounding convention for a gated control.
+    An all-axes checkbox instead DISABLES the axis controls it makes
+    meaningless, and says in a label why: a control that vanishes the
+    moment you tick a nearby box reads as a bug and sends the user
+    hunting for the setting they just lost, while a grayed-out one with
+    a reason beside it reads as the explanation it is, and shows the
+    axis value that is still stored and comes back when the box is
+    unticked.
     """
     lock_box = param_box.box()
     row = lock_box.row()
@@ -144,21 +159,188 @@ def _draw_lock_translation(param_box, group, actual_index):
     # The axis field is HIDDEN, not merely disabled, unless its own
     # checkbox is checked.
     if assigned.lock_translation_enable:
-        lock_box.prop(assigned, "lock_translation_axis")
-        if tuple(assigned.lock_translation_axis) == (0.0, 0.0, 0.0):
+        lock_box.prop(assigned, "lock_translation_all")
+        axis_col = lock_box.column()
+        axis_col.enabled = not assigned.lock_translation_all
+        axis_col.prop(assigned, "lock_translation_axis")
+        if assigned.lock_translation_all:
+            # A zero axis is the CORRECT state to send for an all-axes
+            # lock, so the zero warning below must not fire here.
+            lock_box.label(
+                text="Axis is ignored while all translations are locked",
+                icon="INFO",
+            )
+        elif tuple(assigned.lock_translation_axis) == (0.0, 0.0, 0.0):
             lock_box.label(
                 text="Axis is zero; scene build will fail until it is non-zero",
                 icon="ERROR",
             )
     lock_box.prop(assigned, "lock_rotation_enable")
     if assigned.lock_rotation_enable:
-        lock_box.prop(assigned, "lock_rotation_prohibit_axis")
-        lock_box.prop(assigned, "lock_rotation_axis")
-        if tuple(assigned.lock_rotation_axis) == (0.0, 0.0, 0.0):
+        lock_box.prop(assigned, "lock_rotation_all")
+        rotation_col = lock_box.column()
+        rotation_col.enabled = not assigned.lock_rotation_all
+        rotation_col.prop(assigned, "lock_rotation_prohibit_axis")
+        rotation_col.prop(assigned, "lock_rotation_axis")
+        if assigned.lock_rotation_all:
+            # An all-axes rotation lock names no axis, so neither the
+            # axis nor its whitelist / blacklist mode reaches the solver
+            # and the zero warning below must not fire here either.
+            lock_box.label(
+                text="Axis and its mode are ignored while all rotations are locked",
+                icon="INFO",
+            )
+        elif tuple(assigned.lock_rotation_axis) == (0.0, 0.0, 0.0):
             lock_box.label(
                 text="Axis is zero; scene build will fail until it is non-zero",
                 icon="ERROR",
             )
+
+
+def _draw_intersection_allowances(param_box, group):
+    """Allowances that let a run start, and keep going, through an overlap
+    the scene arrives with (issue #138).
+
+    Drawn for EVERY group type, after the type-specific material block: an
+    intersection is a property of a pair of elements, not of a material model,
+    and a STATIC collider is as likely to be shipped self-tangled as a garment
+    is to be fitted through one.
+
+    On a STATIC group the control reaches the solver only when the collider is
+    part of the solved scene, which means animated, soft-constrained, or named
+    as one end of a cross-stitch; each of those decodes to a pin shell whose
+    vertices carry the policy. A collider that is none of them stays a
+    contact-only collision mesh and neither box changes any pair. It is drawn
+    anyway rather than hidden, per the panel rule that a conditional control
+    stays visible; deciding which of the three conditions holds would mean
+    inspecting the group's ops and stitches on every redraw.
+
+    Both settings live on the group and are applied to every Blender object
+    assigned to it, while self versus inter-object is decided per OBJECT. Two
+    objects of one group therefore make an inter-object pair, which the second
+    label states in the one case where the difference decides the outcome: the
+    group holds more than one object and covers only the self case.
+    """
+    box = param_box.box()
+    box.label(text="Allow Intersections")
+    box.prop(group, "allow_self_intersection")
+    box.prop(group, "allow_inter_object_intersection")
+    if group.allow_self_intersection or group.allow_inter_object_intersection:
+        box.label(
+            text="Overlaps are simulated, not reported",
+            icon="INFO",
+        )
+    if (group.allow_self_intersection
+            and not group.allow_inter_object_intersection
+            and len(group.assigned_objects) > 1):
+        box.label(
+            text="Two objects in one group are an inter-object pair",
+            icon="INFO",
+        )
+
+
+def _material_prop(layout, group, prop_name, text=None):
+    """One material parameter row: the value, a lock, and the animate knob.
+
+    `text` overrides the field label, for the rows whose label depends on
+    another setting (Young's modulus reads Pa or Pa/rho).
+
+    Mirrors Transform > Location. The padlock guards the value against the
+    tools that overwrite a whole group at once (material presets, paste
+    material), and `prop_decorator` is Blender's OWN keyframe control, so a
+    keyframe inserted here behaves exactly as it does anywhere else in Blender
+    and shows the same animated / keyed colouring on the field.
+
+    Only the value is disabled by the lock. The padlock and the decorator stay
+    live, or a locked property could be neither unlocked nor keyed from the
+    panel that locked it.
+    """
+    locked = is_locked(group, prop_name)
+    row = layout.row(align=True)
+    field = row.row(align=True)
+    field.enabled = not locked
+    if text is None:
+        field.prop(group, prop_name)
+    else:
+        field.prop(group, prop_name, text=text)
+    row.prop(
+        group,
+        lock_name(prop_name),
+        text="",
+        emboss=False,
+        icon="LOCKED" if locked else "UNLOCKED",
+    )
+    row.prop_decorator(group, prop_name)
+
+
+def _draw_material_maps(param_box, group, actual_index):
+    """Draw the group's spatial material maps.
+
+    Each row is one parameter varied across the surface, blended from this
+    group's own slider toward the row's target and weighted per vertex. A row
+    with no source name is drawn in alert color: an unnamed source cannot be
+    resolved at encode and would abort the transfer, so it is worth showing
+    before the artist presses it.
+
+    A row's own source is the map at the start frame. Its samples name later
+    sources, and the weights between two consecutive samples are their linear
+    interpolation, so a constant hold is two samples naming one source.
+    """
+    box = param_box.box()
+    box.label(text="Spatial Material Maps", icon="GROUP_VERTEX")
+    row = box.row()
+    row.template_list(
+        "OBJECT_UL_MaterialMapsList",
+        "",
+        group,
+        "material_maps",
+        group,
+        "material_maps_index",
+        rows=2,
+    )
+    buttons = row.column(align=True)
+    buttons.operator(
+        "object.ppf_add_material_map", text="", icon="ADD"
+    ).slot = actual_index
+    buttons.operator(
+        "object.ppf_remove_material_map", text="", icon="REMOVE"
+    ).slot = actual_index
+    if group.object_type == "SOLID":
+        box.label(
+            text="Interior values are extended from the painted surface",
+            icon="INFO",
+        )
+    if 0 <= group.material_maps_index < len(group.material_maps):
+        selected = group.material_maps[group.material_maps_index]
+        detail = box.column(align=True)
+        detail.prop(selected, "source_type")
+        detail.prop(selected, "source_name")
+        detail.prop(selected, "target_value")
+        box.separator()
+        box.label(text="The source above is the map at the start frame")
+        sample_row = box.row()
+        sample_row.template_list(
+            "OBJECT_UL_MaterialMapSamplesList",
+            "",
+            selected,
+            "samples",
+            selected,
+            "samples_index",
+            rows=2,
+        )
+        sample_buttons = sample_row.column(align=True)
+        sample_buttons.operator(
+            "object.ppf_add_material_map_sample", text="", icon="ADD"
+        ).slot = actual_index
+        sample_buttons.operator(
+            "object.ppf_remove_material_map_sample", text="", icon="REMOVE"
+        ).slot = actual_index
+        if 0 <= selected.samples_index < len(selected.samples):
+            sample = selected.samples[selected.samples_index]
+            sample_detail = box.column(align=True)
+            sample_detail.prop(sample, "frame")
+            sample_detail.prop(sample, "source_type")
+            sample_detail.prop(sample, "source_name")
 
 
 def _draw_collision_windows(param_box, group, actual_index):
@@ -350,6 +532,19 @@ def _draw_pdrd_pins(pin_box, group, actual_index, context):
         icon="INFO",
     )
 
+    # A PDRD group reaches this block instead of the shared pin block, so the
+    # per-pin intersection allowance is drawn here as well. The encoder treats
+    # a PDRD pin like any other (only STATIC is skipped), so a pin here carries
+    # the flag to the solver the same way.
+    row = col.row(align=True)
+    row.prop(pin_item, "allow_intersection")
+    if pin_item.allow_intersection:
+        col.label(
+            text="Fully pinned faces may overlap; "
+                 "partly pinned ones still report",
+            icon="INFO",
+        )
+
     # Optional motion steps. No steps -> the pin just holds.
     col.separator()
     col.label(text="Motion steps (optional):")
@@ -536,7 +731,7 @@ def _draw_stitch_stiffness(layout, group):
     has = _group_has_stitch(group)
     col = layout.column()
     col.enabled = has
-    col.prop(group, "stitch_stiffness")
+    _material_prop(col, group, "stitch_stiffness")
     if not has:
         layout.label(text="No loose-edge stitches in this group", icon="INFO")
 
@@ -599,9 +794,9 @@ def _draw_damping(layout, group, include_bending):
     """
     box = layout.box()
     box.label(text="Rayleigh Damping")
-    box.prop(group, "deformation_damping")
+    _material_prop(box, group, "deformation_damping")
     if include_bending:
-        box.prop(group, "bending_damping")
+        _material_prop(box, group, "bending_damping")
 
 
 def get_active_groups_with_indices(scene):
@@ -790,76 +985,13 @@ class MAIN_PT_SceneConfiguration(Panel):
             wind_box.prop(params, "preview_wind_direction")
             wind_box.prop(params, "wind_strength")
 
-        # Dynamic Scene Parameters
-        dyn_box = layout.box()
-        dyn_row = dyn_box.row()
-        dyn_row.prop(
-            params,
-            "show_dyn_params",
-            icon="TRIA_DOWN" if params.show_dyn_params else "TRIA_RIGHT",
-            emboss=False,
-            icon_only=True,
-        )
-        dyn_row.label(text="Dynamic Parameters", icon="TIME")
-        if params.show_dyn_params:
-            dyn_box.template_list(
-                "SCENE_UL_DynParamsList", "",
-                params, "dyn_params",
-                params, "dyn_params_index",
-                rows=2,
-            )
-            row = dyn_box.row(align=True)
-            row.operator_menu_enum(
-                "scene.add_dyn_param", "param_type",
-                text="Add", icon="ADD",
-            )
-            rm_row = row.row()
-            rm_row.enabled = 0 <= params.dyn_params_index < len(params.dyn_params)
-            rm_row.operator("scene.remove_dyn_param", text="Remove", icon="REMOVE")
-
-            dyn_idx = params.dyn_params_index
-            if 0 <= dyn_idx < len(params.dyn_params):
-                dyn_item = params.dyn_params[dyn_idx]
-                dyn_box.separator()
-                dyn_box.template_list(
-                    "SCENE_UL_DynParamKeyframesList", "",
-                    dyn_item, "keyframes",
-                    dyn_item, "keyframes_index",
-                    rows=2,
-                )
-                kf_row = dyn_box.row(align=True)
-                kf_row.operator(
-                    "scene.add_dyn_param_keyframe",
-                    text="Add Keyframe", icon="ADD",
-                )
-                kf_rm = kf_row.row()
-                kf_rm.enabled = (
-                    0 <= dyn_item.keyframes_index < len(dyn_item.keyframes)
-                    and dyn_item.keyframes_index > 0
-                )
-                kf_rm.operator(
-                    "scene.remove_dyn_param_keyframe",
-                    text="Remove", icon="REMOVE",
-                )
-
-                kf_idx = dyn_item.keyframes_index
-                if 0 <= kf_idx < len(dyn_item.keyframes):
-                    kf = dyn_item.keyframes[kf_idx]
-                    kf_box = dyn_box.box()
-                    if kf_idx == 0:
-                        kf_box.label(text="Uses global parameter values", icon="INFO")
-                    else:
-                        kf_box.prop(kf, "frame")
-                        kf_box.prop(kf, "use_hold")
-                        if not kf.use_hold:
-                            if dyn_item.param_type == "GRAVITY":
-                                kf_box.prop(kf, "gravity_value")
-                            elif dyn_item.param_type == "WIND":
-                                kf_box.prop(kf, "wind_direction_value")
-                                kf_box.prop(kf, "wind_strength_value")
-                            else:
-                                kf_box.prop(kf, "scalar_value")
-
+        # The addon's own scene-parameter keyframe list is gone. Those settings
+        # are keyframed on their own sliders now, the same gesture that drives
+        # a material parameter, so the curves live on the timeline with every
+        # other keyframe instead of in a list only this panel could show. A
+        # saved scene's legacy entries are converted on load
+        # (core/migrate_dyn_params.py); the PropertyGroups stay registered so
+        # that conversion has something to read.
         # Invisible Colliders (enclosed box)
         ic_box = layout.box()
         ic_row = ic_box.row()
@@ -1455,6 +1587,25 @@ class DYNAMICS_PT_Groups(Panel):
                             row.enabled = not pin_item.use_pull
                             row.prop(pin_item, "fix_weight_threshold")
 
+                        # Per-pin intersection allowance. Drawn for every group
+                        # type and always editable: it applies to both pin modes
+                        # (a fixed pin's placement is prescribed, a pull pin
+                        # holds only as hard as its own force), and whether it
+                        # changes anything depends on which faces the pin covers
+                        # entirely, which is a per-face question the panel cannot
+                        # answer without an O(N) scan on every redraw. The label
+                        # below states that scope when the option is on, so the
+                        # user is not left expecting it to cover a partly pinned
+                        # face.
+                        row = col.row(align=True)
+                        row.prop(pin_item, "allow_intersection")
+                        if pin_item.allow_intersection:
+                            col.label(
+                                text="Fully pinned faces may overlap; "
+                                     "partly pinned ones still report",
+                                icon="INFO",
+                            )
+
                         # Operations list
                         col.separator()
                         ops_row = col.row()
@@ -1681,34 +1832,35 @@ class DYNAMICS_PT_Groups(Panel):
                 if group.show_parameters:
                     if group.object_type == "SOLID":
                         param_box.prop(group, "solid_model")
-                        param_box.prop(group, "solid_density")
+                        _material_prop(param_box, group, "solid_density")
                         ym_box = param_box.box()
-                        ym_box.prop(
-                            group, "solid_young_modulus",
+                        _material_prop(
+                            ym_box, group, "solid_young_modulus",
                             text="Young's Modulus (Pa)"
                             if not group.young_mod_density_normalized
                             else "Young's Modulus (Pa/ρ)",
                         )
                         ym_box.prop(group, "young_mod_density_normalized")
-                        param_box.prop(group, "solid_poisson_ratio")
-                        param_box.prop(group, "shrink")
-                        param_box.prop(group, "friction")
+                        _material_prop(param_box, group, "solid_poisson_ratio")
+                        _material_prop(param_box, group, "shrink")
+                        _material_prop(param_box, group, "friction")
 
                         # Contact Gap Settings Box
                         contact_box = param_box.box()
                         contact_box.prop(group, "use_group_bounding_box_diagonal")
                         if group.use_group_bounding_box_diagonal:
-                            contact_box.prop(group, "contact_gap_rat")
-                            contact_box.prop(group, "contact_offset_rat")
+                            _material_prop(contact_box, group, "contact_gap_rat")
+                            _material_prop(contact_box, group, "contact_offset_rat")
                         else:
-                            contact_box.prop(group, "contact_gap")
-                            contact_box.prop(group, "contact_offset")
+                            _material_prop(contact_box, group, "contact_gap")
+                            _material_prop(contact_box, group, "contact_offset")
                         _draw_collision_windows(param_box, group, actual_index)
+                        _draw_material_maps(param_box, group, actual_index)
                         plast_box = param_box.box()
                         plast_box.prop(group, "enable_plasticity")
                         if group.enable_plasticity:
-                            plast_box.prop(group, "plasticity")
-                            plast_box.prop(group, "plasticity_threshold")
+                            _material_prop(plast_box, group, "plasticity")
+                            _material_prop(plast_box, group, "plasticity_threshold")
                         _draw_velocity_keyframes(param_box, group, actual_index, show_angular=True)
                         _draw_lock_translation(param_box, group, actual_index)
                         _draw_tetrahedralizer(param_box, group, actual_index)
@@ -1716,33 +1868,33 @@ class DYNAMICS_PT_Groups(Panel):
                         _draw_stitch_stiffness(param_box, group)
                     elif group.object_type == "SHELL":
                         param_box.prop(group, "shell_model")
-                        param_box.prop(group, "shell_density")
+                        _material_prop(param_box, group, "shell_density")
                         ym_box = param_box.box()
-                        ym_box.prop(
-                            group, "shell_young_modulus",
+                        _material_prop(
+                            ym_box, group, "shell_young_modulus",
                             text="Young's Modulus (Pa)"
                             if not group.young_mod_density_normalized
                             else "Young's Modulus (Pa/ρ)",
                         )
                         ym_box.prop(group, "young_mod_density_normalized")
-                        param_box.prop(group, "shell_poisson_ratio")
-                        param_box.prop(group, "friction")
+                        _material_prop(param_box, group, "shell_poisson_ratio")
+                        _material_prop(param_box, group, "friction")
 
                         # Contact Gap Settings Box
                         contact_box = param_box.box()
                         contact_box.prop(group, "use_group_bounding_box_diagonal")
                         if group.use_group_bounding_box_diagonal:
-                            contact_box.prop(group, "contact_gap_rat")
-                            contact_box.prop(group, "contact_offset_rat")
+                            _material_prop(contact_box, group, "contact_gap_rat")
+                            _material_prop(contact_box, group, "contact_offset_rat")
                         else:
-                            contact_box.prop(group, "contact_gap")
-                            contact_box.prop(group, "contact_offset")
+                            _material_prop(contact_box, group, "contact_gap")
+                            _material_prop(contact_box, group, "contact_offset")
                         _draw_collision_windows(param_box, group, actual_index)
-                        param_box.prop(group, "bend")
+                        _material_prop(param_box, group, "bend")
                         aniso_col = param_box.column(align=True)
-                        aniso_col.prop(group, "bend_warp")
-                        aniso_col.prop(group, "bend_weft")
-                        if group.bend_warp > 0.0 or group.bend_weft > 0.0:
+                        _material_prop(aniso_col, group, "bend_warp")
+                        _material_prop(aniso_col, group, "bend_weft")
+                        if wants_anisotropic_bending(group):
                             missing_uv = group_missing_uv_object(group)
                             if missing_uv is not None:
                                 param_box.label(
@@ -1750,8 +1902,8 @@ class DYNAMICS_PT_Groups(Panel):
                                     icon="ERROR",
                                 )
                         row = param_box.row(align=True)
-                        row.prop(group, "shrink_x")
-                        row.prop(group, "shrink_y")
+                        _material_prop(row, group, "shrink_x")
+                        _material_prop(row, group, "shrink_y")
                         sl_box = param_box.box()
                         sl_box.prop(group, "enable_strain_limit")
                         if group.enable_strain_limit:
@@ -1760,16 +1912,17 @@ class DYNAMICS_PT_Groups(Panel):
                                     text="Shrink/extend disables strain limiting",
                                     icon="ERROR",
                                 )
-                            sl_box.prop(group, "strain_limit_percent")
+                            _material_prop(sl_box, group, "strain_limit_percent")
                         inf_box = param_box.box()
                         inf_box.prop(group, "enable_inflate")
                         if group.enable_inflate:
-                            inf_box.prop(group, "inflate_pressure")
+                            _material_prop(inf_box, group, "inflate_pressure")
+                        _draw_material_maps(param_box, group, actual_index)
                         plast_box = param_box.box()
                         plast_box.prop(group, "enable_plasticity")
                         if group.enable_plasticity:
-                            plast_box.prop(group, "plasticity")
-                            plast_box.prop(group, "plasticity_threshold")
+                            _material_prop(plast_box, group, "plasticity")
+                            _material_prop(plast_box, group, "plasticity_threshold")
                         bplast_box = param_box.box()
                         bplast_box.prop(group, "bend_rest_angle_source")
                         bplast_box.prop(group, "bend_rest_from_reference")
@@ -1777,33 +1930,33 @@ class DYNAMICS_PT_Groups(Panel):
                             _draw_bend_reference(bplast_box, group, actual_index)
                         bplast_box.prop(group, "enable_bend_plasticity")
                         if group.enable_bend_plasticity:
-                            bplast_box.prop(group, "bend_plasticity")
-                            bplast_box.prop(group, "bend_plasticity_threshold")
+                            _material_prop(bplast_box, group, "bend_plasticity")
+                            _material_prop(bplast_box, group, "bend_plasticity_threshold")
                         _draw_velocity_keyframes(param_box, group, actual_index, show_angular=True)
                         _draw_lock_translation(param_box, group, actual_index)
                         _draw_damping(param_box, group, include_bending=True)
                         _draw_stitch_stiffness(param_box, group)
                     elif group.object_type == "ROD":
                         # Rod model is always ARAP, no need to show selection
-                        param_box.prop(group, "rod_density")
+                        _material_prop(param_box, group, "rod_density")
                         ym_box = param_box.box()
-                        ym_box.prop(
-                            group, "rod_young_modulus",
+                        _material_prop(
+                            ym_box, group, "rod_young_modulus",
                             text="Young's Modulus (Pa)"
                             if not group.young_mod_density_normalized
                             else "Young's Modulus (Pa/ρ)",
                         )
                         ym_box.prop(group, "young_mod_density_normalized")
-                        param_box.prop(group, "friction")
-                        param_box.prop(group, "length_factor")
+                        _material_prop(param_box, group, "friction")
+                        _material_prop(param_box, group, "length_factor")
 
                         contact_box = param_box.box()
-                        contact_box.prop(group, "contact_gap")
-                        contact_box.prop(group, "contact_offset")
+                        _material_prop(contact_box, group, "contact_gap")
+                        _material_prop(contact_box, group, "contact_offset")
                         _draw_collision_windows(param_box, group, actual_index)
                         bend_box = param_box.box()
                         bend_box.label(text="Bend")
-                        bend_box.prop(group, "bend")
+                        _material_prop(bend_box, group, "bend")
                         bend_box.prop(group, "bend_rest_angle_source")
                         bend_box.prop(group, "bend_rest_from_reference")
                         if group.bend_rest_from_reference:
@@ -1811,12 +1964,12 @@ class DYNAMICS_PT_Groups(Panel):
                         sl_box = param_box.box()
                         sl_box.prop(group, "enable_strain_limit")
                         if group.enable_strain_limit:
-                            sl_box.prop(group, "strain_limit_percent")
+                            _material_prop(sl_box, group, "strain_limit_percent")
                         bplast_box = param_box.box()
                         bplast_box.prop(group, "enable_bend_plasticity")
                         if group.enable_bend_plasticity:
-                            bplast_box.prop(group, "bend_plasticity")
-                            bplast_box.prop(group, "bend_plasticity_threshold")
+                            _material_prop(bplast_box, group, "bend_plasticity")
+                            _material_prop(bplast_box, group, "bend_plasticity_threshold")
                         _draw_velocity_keyframes(param_box, group, actual_index)
                         _draw_lock_translation(param_box, group, actual_index)
                         _draw_damping(param_box, group, include_bending=True)
@@ -1826,8 +1979,8 @@ class DYNAMICS_PT_Groups(Panel):
                         # best-fit rigid transform shared by the whole
                         # body. No internal elastic terms, no plasticity,
                         # no bending.
-                        param_box.prop(group, "pdrd_density")
-                        param_box.prop(group, "friction")
+                        _material_prop(param_box, group, "pdrd_density")
+                        _material_prop(param_box, group, "friction")
 
                         # Hinge is per object: expandable box with an object
                         # pulldown (like Velocity Overwrite) to focus a body
@@ -1858,11 +2011,11 @@ class DYNAMICS_PT_Groups(Panel):
                         contact_box = param_box.box()
                         contact_box.prop(group, "use_group_bounding_box_diagonal")
                         if group.use_group_bounding_box_diagonal:
-                            contact_box.prop(group, "contact_gap_rat")
-                            contact_box.prop(group, "contact_offset_rat")
+                            _material_prop(contact_box, group, "contact_gap_rat")
+                            _material_prop(contact_box, group, "contact_offset_rat")
                         else:
-                            contact_box.prop(group, "contact_gap")
-                            contact_box.prop(group, "contact_offset")
+                            _material_prop(contact_box, group, "contact_gap")
+                            _material_prop(contact_box, group, "contact_offset")
                         _draw_collision_windows(param_box, group, actual_index)
                         _draw_velocity_keyframes(
                             param_box, group, actual_index, show_angular=True,
@@ -1899,13 +2052,13 @@ class DYNAMICS_PT_Groups(Panel):
                         param_box.label(
                             text="Grain radius is locked at convert", icon="INFO"
                         )
-                        param_box.prop(group, "sand_particle_mass")
-                        param_box.prop(group, "sand_friction")
+                        _material_prop(param_box, group, "sand_particle_mass")
+                        _material_prop(param_box, group, "sand_friction")
                         # The grain radius doubles as the contact offset (the
                         # grain's physical skin); the contact gap is the extra
                         # barrier activation distance on top.
                         contact_box = param_box.box()
-                        contact_box.prop(group, "contact_gap")
+                        _material_prop(contact_box, group, "contact_gap")
                         contact_box.label(
                             text="Grain radius is the contact offset", icon="INFO"
                         )
@@ -1914,7 +2067,7 @@ class DYNAMICS_PT_Groups(Panel):
                         # group level (above Delete Group), not here, so it stays
                         # visible without expanding this section.
                     else:  # STATIC
-                        param_box.prop(group, "friction")
+                        _material_prop(param_box, group, "friction")
 
                         soft_box = param_box.box()
                         soft_box.prop(group, "enable_soft_constraint")
@@ -1924,11 +2077,24 @@ class DYNAMICS_PT_Groups(Panel):
                         contact_box = param_box.box()
                         contact_box.prop(group, "use_group_bounding_box_diagonal")
                         if group.use_group_bounding_box_diagonal:
-                            contact_box.prop(group, "contact_gap_rat")
-                            contact_box.prop(group, "contact_offset_rat")
+                            _material_prop(contact_box, group, "contact_gap_rat")
+                            _material_prop(contact_box, group, "contact_offset_rat")
                         else:
-                            contact_box.prop(group, "contact_gap")
-                            contact_box.prop(group, "contact_offset")
+                            _material_prop(contact_box, group, "contact_gap")
+                            _material_prop(contact_box, group, "contact_offset")
+
+                    # Outside the type chain on purpose: both tolerances apply
+                    # to every group type.
+                    _draw_intersection_allowances(param_box, group)
+
+                    # The map list is drawn by the SOLID and SHELL branches
+                    # above. A group whose type was changed afterwards keeps
+                    # its rows, and they still reach the encoder, so they are
+                    # drawn here too rather than becoming unreachable state.
+                    if group.object_type not in ("SOLID", "SHELL") and len(
+                        group.material_maps
+                    ):
+                        _draw_material_maps(param_box, group, actual_index)
 
 
 class SNAPMERGE_PT_SnapAndMerge(Panel):

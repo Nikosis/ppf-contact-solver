@@ -59,6 +59,19 @@ Running `get_object_bounding_box_diagonal(object_name)` on the target
 object is a cheap way to get a sense of scale before deciding what
 "small clearance" means in Blender units.
 
+Separating the geometry is the first answer and stays the default. For a
+scene that cannot be authored that way, a garment imported already fitted
+onto a posed character being the usual case,
+`set_group_material_properties` accepts `allow_self_intersection` and
+`allow_inter_object_intersection`, which let the run start through an
+overlap that is already there. Each is applied to every object assigned to
+the group, and which of the two covers a given pair is decided per Blender
+object: two objects in one group form an inter-object pair. Either side of a
+pair is enough for the inter-object one. They suppress the report only,
+contact is unchanged, and they buy nothing where clearance is achievable:
+see
+[Allow Intersections](../workflow/params/material.md#allow-intersections).
+
 ## Creating Sphere Primitives
 
 When an agent needs a spherical mesh (a ball, a drop, a filler object),

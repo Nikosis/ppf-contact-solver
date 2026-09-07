@@ -173,13 +173,34 @@ try:
     record("poll_local_empty_enabled", connect_enabled() is True,
            {"path": "<empty>"})
 
+    # Windows Native is the one backend whose path never reaches a shell: it
+    # is an os.path.join base, a subprocess.Popen argv element, and that
+    # Popen's cwd. So it is held to the metacharacter rule alone. A space is
+    # ordinary in a Windows path ("C:/Program Files/..."), and refusing it
+    # here greyed the Connect button out with nothing the user could act on.
+    # LOCAL above keeps the whitespace rule because its launch path writes
+    # the directory into a generated shell script.
     props.server_type = "WIN_NATIVE"
     props.win_native_path = "C:/ppf-contact-solver/build"
     record("poll_win_clean_enabled", connect_enabled() is True,
            {"path": props.win_native_path})
     props.win_native_path = "C:/Program Files/ppf"
-    record("poll_win_space_disabled", connect_enabled() is False,
+    record("poll_win_space_enabled", connect_enabled() is True,
            {"path": props.win_native_path})
+    props.win_native_path = "C:/ppf&run"
+    record("poll_win_ampersand_disabled", connect_enabled() is False,
+           {"path": props.win_native_path})
+
+    # ---- the two path predicates, and what separates them ----
+    fsu = utils.find_shell_unsafe_path_char
+    fip = utils.find_invalid_path_char
+    record("shell_unsafe_allows_a_space", fsu("C:/Program Files/ppf") is None,
+           {"v": fsu("C:/Program Files/ppf")})
+    record("invalid_path_still_flags_a_space", fip("C:/Program Files/ppf") == " ",
+           {"v": fip("C:/Program Files/ppf")})
+    record("both_flag_a_metacharacter",
+           fsu("/data&run") == "&" and fip("/data&run") == "&",
+           {"shell": fsu("/data&run"), "invalid": fip("/data&run")})
 
     # ---- project name validator (stricter: no path separators either) ----
     fin = utils.find_invalid_name_char

@@ -55,6 +55,23 @@ from ._scene_transform_ import (
 )
 from ._utils_ import Utils
 
+# Aggregate rigid-mode lock modes, mirroring the solver's
+# `TranslationLockMode` / `RotationLockMode` in
+# `crates/ppf-cts-solver/src/cpp/data.hpp` and its Rust twin in
+# `data.rs`. Written to bin/translation_lock_mode.bin and
+# bin/rotation_lock_mode.bin as uint32.
+#
+# THE MODE CARRIES THE ENABLE BIT, not the axis: an all-axes mode has no
+# direction, so its axis row is exactly zero, which every axis-mode row
+# also uses to mean disabled. The two tables are therefore only readable
+# together, and zero stays the off value in both so a session written
+# without a mode table decodes to the single-axis behavior.
+TRANSLATION_LOCK_AXIS = 0
+TRANSLATION_LOCK_ALL = 1
+ROTATION_LOCK_ALLOW_ONLY = 0
+ROTATION_LOCK_PROHIBIT_AXIS = 1
+ROTATION_LOCK_ALL = 2
+
 
 def _visible_rows(
     elements: np.ndarray, invisible: Optional[np.ndarray]
@@ -91,6 +108,13 @@ class EnumColor(Enum):
     AREA = 1
 
 
+# `VertexProp::intersect_policy` bits. Mirrored from
+# `crates/ppf-cts-solver/src/data.rs` (and `cpp/data.hpp`), which is where the
+# solver reads them; keep the three in step.
+_INTERSECT_ALLOW_SELF = 1 << 0
+_INTERSECT_ALLOW_INTER_OBJECT = 1 << 1
+
+
 class FixedScene:
     """A fixed scene class.
 
@@ -114,27 +138,28 @@ class FixedScene:
     # attribute instead of raising at preview time.
     _invisible_vert: Optional[np.ndarray] = None
     _invisible_static_vert: Optional[np.ndarray] = None
-    # Lock Translation axis table, one normalized (or zero/disabled) row
-    # per dmap entry. Class-scope default so a FixedScene unpickled from a
-    # session saved before this feature existed still answers the
-    # attribute instead of raising at export time.
-    _translation_lock: Optional[np.ndarray] = None
-    # Lock Rotation axis table, one normalized (or zero/disabled) row per
-    # dmap entry. Coexists independently with `_translation_lock`.
-    # Class-scope default so a FixedScene unpickled from a session saved
-    # before this feature existed still answers the attribute instead of
-    # raising at export time.
-    _rotation_lock: Optional[np.ndarray] = None
-    # Lock Rotation mode table, one uint32 per dmap entry, aligned with
-    # `_rotation_lock`: 0 = allow-only (rotation about the axis is the
-    # only freedom) or disabled, 1 = prohibit-axis (rotation about the
-    # axis is forbidden, the perpendicular plane stays free). A disabled
-    # row (zero axis in `_rotation_lock`) is always 0 here too; the two
-    # tables must be read together since a bare 0 cannot distinguish
-    # "disabled" from "locked, allow-only". Class-scope default so a
+    # Lock Translation axis table, one normalized row per dmap entry, and
+    # its mode table beside it, one uint32 per dmap entry: 0 = axis (the
+    # center of mass is held on the line through that axis), 1 = all
+    # (the center of mass is pinned to its initial point). The axis row
+    # is zero both for a disabled group and for an all-axes group, which
+    # has no direction, so the two tables are only readable together and
+    # the MODE carries the enable bit. Class-scope defaults so a
     # FixedScene unpickled from a session saved before this feature
     # existed still answers the attribute instead of raising at export
     # time.
+    _translation_lock: Optional[np.ndarray] = None
+    _translation_lock_mode: Optional[np.ndarray] = None
+    # Lock Rotation axis table, one normalized row per dmap entry, and
+    # its mode table beside it, one uint32 per dmap entry: 0 = allow-only
+    # (rotation about the axis is the only freedom), 1 = prohibit-axis
+    # (rotation about the axis is forbidden, the perpendicular plane
+    # stays free), 2 = all (there is no net rotation about any axis).
+    # The axis row is zero both for a disabled group and for an all-axes
+    # group, so these two are read together exactly as the translation
+    # pair above. Coexists independently with `_translation_lock`.
+    # Class-scope defaults for the same unpickling reason.
+    _rotation_lock: Optional[np.ndarray] = None
     _rotation_lock_mode: Optional[np.ndarray] = None
 
     def __init__(
@@ -171,6 +196,8 @@ class FixedScene:
         rest_vert_mask: Optional[np.ndarray] = None,
         rest_vert_anim: Optional[np.ndarray] = None,
         rest_vert_times: Optional[np.ndarray] = None,
+        tri_param_anim: Optional[dict[str, list[list[float]]]] = None,
+        param_anim_times: Optional[list[float]] = None,
         bend_rest_vert: Optional[np.ndarray] = None,
         bend_rest_vert_mask: Optional[np.ndarray] = None,
         pdrd_body_rows: Optional[list[float]] = None,
@@ -180,10 +207,14 @@ class FixedScene:
         sand_param: Optional[dict[str, list[Any]]] = None,
         invisible_vert: Optional[np.ndarray] = None,
         translation_lock: Optional[np.ndarray] = None,
+        translation_lock_mode: Optional[np.ndarray] = None,
         rotation_lock: Optional[np.ndarray] = None,
         rotation_lock_mode: Optional[np.ndarray] = None,
         statistics_objects: Optional[list[dict[str, Any]]] = None,
         collider_vert_mask: Optional[np.ndarray] = None,
+        object_vert_index: Optional[np.ndarray] = None,
+        intersect_policy: Optional[np.ndarray] = None,
+        pin_allow_vertices: Optional[np.ndarray] = None,
         quiet: bool = False,
     ):
         """Initialize the fixed scene.
@@ -224,9 +255,10 @@ class FixedScene:
             bend_rest_vert (Optional[np.ndarray]): Concatenated reference vertices for the bending rest angle, one row per global vertex (unmasked rows equal the initial vert). The solver computes hinge rest angles from these positions for masked objects.
             bend_rest_vert_mask (Optional[np.ndarray]): Per-vertex uint8 mask marking rows of ``bend_rest_vert`` that belong to an object with an enabled reference rest angle.
             invisible_vert (Optional[np.ndarray]): Per-vertex bool mask marking dynamic vertices that belong to an object hidden with :meth:`Object.invisible`. Drawing only; the solver never sees it. None when every object is drawn.
-            translation_lock (Optional[np.ndarray]): Per-dmap-entry (n_objects, 3) normalized Lock Translation axis, aligned with ``concat_displacement``. A zero row means the object is not locked. None when no object in the scene has Lock Translation enabled.
-            rotation_lock (Optional[np.ndarray]): Per-dmap-entry (n_objects, 3) normalized Lock Rotation axis, aligned with ``concat_displacement``. A zero row means the object's rotation is not locked. None when no object in the scene has Lock Rotation enabled. Independent of ``translation_lock``.
-            rotation_lock_mode (Optional[np.ndarray]): Per-dmap-entry (n_objects,) uint32, aligned with ``rotation_lock``: 0 means allow-only (rotation about the axis is the only freedom) or the row is disabled; 1 means prohibit-axis (rotation about the axis is forbidden, the perpendicular plane stays free). Only meaningful together with a non-zero row of ``rotation_lock``. None when no object in the scene has Lock Rotation enabled.
+            translation_lock (Optional[np.ndarray]): Per-dmap-entry (n_objects, 3) normalized Lock Translation axis, aligned with ``concat_displacement``. A zero row means either that the object is not locked or that it is locked on all axes, which is decided by ``translation_lock_mode``. None when no object in the scene has Lock Translation enabled in any mode.
+            translation_lock_mode (Optional[np.ndarray]): Per-dmap-entry (n_objects,) uint32, aligned with ``translation_lock``: 0 means the center of mass is held on the line through that row's axis (or the row is disabled, its axis being zero); 1 means the center of mass is pinned to its initial point, in which case the axis row carries no direction and is exactly zero. Read together with ``translation_lock``, never alone. None under the same condition as ``translation_lock``.
+            rotation_lock (Optional[np.ndarray]): Per-dmap-entry (n_objects, 3) normalized Lock Rotation axis, aligned with ``concat_displacement``. A zero row means either that the object's rotation is not locked or that it is locked on all axes, which is decided by ``rotation_lock_mode``. None when no object in the scene has Lock Rotation enabled in any mode. Independent of ``translation_lock``.
+            rotation_lock_mode (Optional[np.ndarray]): Per-dmap-entry (n_objects,) uint32, aligned with ``rotation_lock``: 0 means allow-only (rotation about that row's axis is the only freedom, or the row is disabled, its axis being zero); 1 means prohibit-axis (rotation about the axis is forbidden, the perpendicular plane stays free); 2 means all axes are locked, in which case the axis row carries no direction and is exactly zero. Read together with ``rotation_lock``, never alone. None under the same condition as ``rotation_lock``.
             quiet (bool): When True, suppress the scene-check summary prints. Defaults to False, preserving the interactive diagnostic output.
         """
 
@@ -247,6 +279,12 @@ class FixedScene:
         self._tet = tet
         self._rod_param = rod_param
         self._tri_param = tri_param
+        # Animated material schedule: key -> one per-triangle list per
+        # keyframe, aligned to `param_anim_times`. Both empty for a scene with
+        # no animated material, which writes no bin/param_anim directory and
+        # leaves the solver on its build-time tables.
+        self._tri_param_anim = tri_param_anim or {}
+        self._param_anim_times = param_anim_times or []
         self._tet_param = tet_param
         # Scalar SAND (faceless point cloud) params. None for a scene with no
         # points object; exported on the "sand-" channel (one float per key).
@@ -265,25 +303,27 @@ class FixedScene:
         self._pdrd_vert_list = pdrd_vert_list or []
         self._pdrd_rest_centered = pdrd_rest_centered
         # Lock Translation: one normalized axis per dmap entry (n_objects,
-        # 3), aligned with `_displacement`/`concat_displacement`. None when
-        # no object in the scene has it enabled; a zero row means that
-        # object is not locked. Written to bin/translation_lock.bin at
-        # export time.
+        # 3), aligned with `_displacement`/`concat_displacement`, beside
+        # one uint32 mode per dmap entry. None when no object in the
+        # scene has Lock Translation enabled in any mode; a zero axis row
+        # belongs either to an unlocked object or to an all-axes one, and
+        # the mode says which. Written to bin/translation_lock.bin and
+        # bin/translation_lock_mode.bin at export time.
         self._translation_lock = translation_lock
-        # Lock Rotation: one normalized axis per dmap entry (n_objects, 3),
-        # aligned the same way. None when no object in the scene has it
-        # enabled; a zero row means that object's rotation is not locked.
-        # Coexists independently with `_translation_lock`. Written to
-        # bin/rotation_lock.bin at export time.
-        self._rotation_lock = rotation_lock
-        # Lock Rotation mode: one uint32 per dmap entry, aligned with
-        # `_rotation_lock`. 0 = allow-only or disabled, 1 = prohibit-axis.
-        # None when no object in the scene has Lock Rotation enabled
-        # (same emptiness condition as `_rotation_lock`). Written to
+        self._translation_lock_mode = translation_lock_mode
+        # Lock Rotation: one normalized axis per dmap entry (n_objects, 3)
+        # beside one uint32 mode per dmap entry, aligned the same way and
+        # read the same way. None when no object in the scene has Lock
+        # Rotation enabled in any mode. Coexists independently with
+        # `_translation_lock`. Written to bin/rotation_lock.bin and
         # bin/rotation_lock_mode.bin at export time.
+        self._rotation_lock = rotation_lock
         self._rotation_lock_mode = rotation_lock_mode
         self._statistics_objects = statistics_objects or []
         self._collider_vert_mask = collider_vert_mask
+        self._object_vert_index = object_vert_index
+        self._intersect_policy = intersect_policy
+        self._pin_allow_vertices = pin_allow_vertices
         self._pin: list[PinData] = []
         self._static_vert = (np.zeros(0, dtype=np.uint32), np.zeros(0))
         self._static_color = np.zeros((0, 0))
@@ -435,6 +475,27 @@ class FixedScene:
             wall_data,
             sphere_data,
             bool(self._has_dyn_color),
+            # Intersection allowances (issue #138). This build-time check and
+            # the solver's own check_intersection must grant the same set, so
+            # both read the same three per-vertex facts. Object ids are small
+            # and dense here, so the u32 object index narrows to i32 without
+            # loss; -1 is reserved for the STATIC collision vertices the Rust
+            # side appends.
+            vert_object_id=(
+                np.ascontiguousarray(self._object_vert_index, dtype=np.int32)
+                if self._object_vert_index is not None
+                else None
+            ),
+            vert_policy=(
+                np.ascontiguousarray(self._intersect_policy, dtype=np.uint32)
+                if self._intersect_policy is not None
+                else None
+            ),
+            vert_pin_allow=(
+                np.ascontiguousarray(self._pin_allow_vertices, dtype=bool)
+                if self._pin_allow_vertices is not None
+                else None
+            ),
         )
         checks_pbar.update(1)
         checks_pbar.set_postfix_str("rod-tri offset")
@@ -922,6 +983,28 @@ class FixedScene:
             self._collider_vert_mask.astype(np.uint8).tofile(
                 os.path.join(bin_path, "collider_vert.bin")
             )
+        # Source-object identity per dynamic vertex, read by the solver to tell
+        # a self-intersection from an inter-object one. Absent means the solver
+        # knows no object boundaries and reports every intersecting pair, which
+        # is what a session directory that does not carry this file gets.
+        if self._object_vert_index is not None:
+            assert len(self._object_vert_index) == len(self._vert[1]), (
+                f"object_vert_index has {len(self._object_vert_index)} entries "
+                f"but the scene has {len(self._vert[1])} dynamic vertices"
+            )
+            self._object_vert_index.astype(np.uint32).tofile(
+                os.path.join(bin_path, "object_vert.bin")
+            )
+        # Written only when some object actually asks for an allowance, so a
+        # scene that does not use the feature exports byte-identically.
+        if self._intersect_policy is not None:
+            assert len(self._intersect_policy) == len(self._vert[1]), (
+                f"intersect_policy has {len(self._intersect_policy)} entries "
+                f"but the scene has {len(self._vert[1])} dynamic vertices"
+            )
+            self._intersect_policy.astype(np.uint8).tofile(
+                os.path.join(bin_path, "intersect_policy.bin")
+            )
         self._vert[1].astype(np.float64).tofile(os.path.join(bin_path, "vert.bin"))
         # rest_vert_mask is shared between the static rest_vert and the
         # time-varying rest_vert_anim, so write it whenever either is present.
@@ -954,31 +1037,43 @@ class FixedScene:
                 )
         # Lock Translation: one normalized world-space axis per displacement
         # group (dmap entry), aligned with vert_dmap/displacement.bin
-        # ordering. A zero row means that object is not locked. Absent
-        # entirely when no object in the scene enabled it (mirrors the
-        # other optional per-scene tables above).
+        # ordering, beside one uint32 mode per group. Absent entirely when
+        # no object in the scene enabled Lock Translation in any mode
+        # (mirrors the other optional per-scene tables above); the mode
+        # table is written under exactly that same condition, so the pair
+        # is either both present or both absent and the solver never sees
+        # an axis it cannot interpret.
+        #
+        # Reading the pair: 0 = the center of mass is held on the line
+        # through this row's axis, and a zero axis there means the group
+        # is not locked; 1 = the center of mass is pinned to its initial
+        # point, where no direction exists and the axis row is exactly
+        # zero. A zero axis alone therefore does not mean "disabled", and
+        # the mode alone does not either, since 0 is both the axis mode
+        # and the value a disabled row carries.
         if self._translation_lock is not None:
             np.ascontiguousarray(self._translation_lock, dtype=np.float32).tofile(
                 os.path.join(bin_path, "translation_lock.bin")
             )
-        # Lock Rotation: one normalized world-space axis per displacement
-        # group (dmap entry), aligned the same way as translation_lock.bin
-        # above but independent of it. A zero row means that object's
-        # rotation is not locked. Absent entirely when no object in the
-        # scene enabled it.
+        if self._translation_lock_mode is not None:
+            np.ascontiguousarray(self._translation_lock_mode, dtype=np.uint32).tofile(
+                os.path.join(bin_path, "translation_lock_mode.bin")
+            )
+        # Lock Rotation: the same axis-plus-mode pair per displacement
+        # group, aligned the same way as translation_lock.bin above but
+        # independent of it, and absent entirely when no object in the
+        # scene enabled Lock Rotation in any mode.
+        #
+        # Reading the pair: 0 = allow-only (rotation about this row's
+        # axis is the only freedom, and a zero axis there means the group
+        # is not locked); 1 = prohibit-axis (rotation about the axis is
+        # forbidden, the perpendicular plane stays free); 2 = every axis
+        # is locked, where no direction exists and the axis row is
+        # exactly zero.
         if self._rotation_lock is not None:
             np.ascontiguousarray(self._rotation_lock, dtype=np.float32).tofile(
                 os.path.join(bin_path, "rotation_lock.bin")
             )
-        # Lock Rotation mode: one uint32 per displacement group, aligned
-        # with rotation_lock.bin. 0 = allow-only (rotation about the axis
-        # is the only freedom) or the row is disabled; 1 = prohibit-axis
-        # (rotation about the axis is forbidden, the perpendicular plane
-        # stays free). A bare 0 cannot distinguish "disabled" from
-        # "locked, allow-only" on its own; that is resolved by reading
-        # this table together with rotation_lock.bin's axis row. Absent
-        # entirely when no object in the scene has Lock Rotation enabled
-        # (same emptiness condition as rotation_lock.bin).
         if self._rotation_lock_mode is not None:
             np.ascontiguousarray(self._rotation_lock_mode, dtype=np.uint32).tofile(
                 os.path.join(bin_path, "rotation_lock_mode.bin")
@@ -1039,6 +1134,29 @@ class FixedScene:
         if len(self._tri):
             self._tri.astype(np.uint64).tofile(os.path.join(bin_path, "tri.bin"))
             export_param(self._tri_param, param_path, "tri")
+        # Animated material schedules go to their own directory so the solver
+        # can tell "this scene animates nothing" from "this key is missing".
+        # Layout matches the static files exactly, repeated once per keyframe,
+        # so both go through the same assembly on the far side.
+        if self._tri_param_anim:
+            assert self._param_anim_times, (
+                "an animated material schedule needs param_anim_times"
+            )
+            anim_path = os.path.join(bin_path, "param_anim")
+            os.makedirs(anim_path, exist_ok=True)
+            np.array(self._param_anim_times, dtype=np.float64).tofile(
+                os.path.join(anim_path, "times.bin")
+            )
+            n_frames = len(self._param_anim_times)
+            for key, frames in self._tri_param_anim.items():
+                assert len(frames) == n_frames, (
+                    f"animated 'tri-{key}' has {len(frames)} frames but "
+                    f"param_anim_times has {n_frames}"
+                )
+                flat = np.concatenate(
+                    [np.asarray(f, dtype=np.float32) for f in frames]
+                )
+                flat.tofile(os.path.join(anim_path, f"tri-{key}.bin"))
         pbar.update(1)
 
         # PDRD per-body and per-vertex tables. Absent files mean the
@@ -1967,6 +2085,10 @@ class Scene:
         self._wall: list[Wall] = []
         self._surface_map_by_name: dict[str, tuple] = {}
         self._cross_stitch: list[dict] = []
+        # Keyframe times shared by every animated material in this scene.
+        # Empty means no object animates a material, which writes no
+        # bin/param_anim and leaves the solver on its build-time tables.
+        self._param_anim_times: list[float] = []
         self.add = ObjectAdder(self)  #: ObjectAdder: The object adder.
         self.info = SceneInfo(name, self)  #: SceneInfo: The scene information.
 
@@ -2138,6 +2260,22 @@ class Scene:
                 print(mgr.list())
         """
         return self._asset
+
+    def set_param_anim_times(self, times: list[float]) -> "Scene":
+        """Set the keyframe times shared by every animated material in the scene.
+
+        Args:
+            times (list[float]): Times in seconds, strictly increasing. Each
+                object's ``set_param_anim`` values align to these, in order.
+
+        Returns:
+            Scene: This scene, for chaining.
+        """
+        t = [float(x) for x in times]
+        if any(b <= a for a, b in zip(t, t[1:])):
+            raise ValueError(f"param_anim_times must be strictly increasing, got {t}")
+        self._param_anim_times = t
+        return self
 
     def build(self, progress_callback=None, quiet: bool = False) -> FixedScene:
         """Build the fixed scene from the current scene.
@@ -2406,37 +2544,70 @@ class Scene:
 
         concat_displacement = assembled["concat_displacement"]
 
-        # ----- Lock Translation: one normalized axis per dmap entry -----
+        # ----- Lock Translation: one axis and one mode per dmap entry ---
         # Aligned with concat_displacement (one row per object, dyn +
         # static, in dmap order); a static object never sets
-        # ``_translation_lock`` so its row stays the zero vector
-        # (disabled). Written to bin/translation_lock.bin at export time.
+        # ``_translation_lock`` or ``_translation_lock_all`` so its row
+        # stays the zero vector in the axis mode (disabled). Written to
+        # bin/translation_lock.bin and bin/translation_lock_mode.bin at
+        # export time.
+        #
+        # An all-axes object contributes a mode of TRANSLATION_LOCK_ALL
+        # over a row left at exactly zero: there is no direction to hold
+        # the center of mass along when it is pinned to a point, and the
+        # solver requires that canonical spelling. So the emptiness test
+        # below cannot be "some object has an axis": that would drop the
+        # whole file for a scene whose only locked objects lock all axes,
+        # and the solver would read it as unlocked with nothing to notice.
         translation_lock = np.zeros((concat_displacement.shape[0], 3), dtype=np.float32)
+        translation_lock_mode = np.zeros(
+            (concat_displacement.shape[0],), dtype=np.uint32
+        )
         has_translation_lock = False
         for name, obj in dyn_objects:
             axis = getattr(obj, "_translation_lock", None)
-            if axis is not None:
+            lock_all = bool(getattr(obj, "_translation_lock_all", False))
+            if lock_all and axis is not None:
+                raise ValueError(
+                    f"object {name!r} carries both a Lock Translation axis and "
+                    "Lock All Translations; the two are mutually exclusive "
+                    "spellings of one lock and the last call must clear the other"
+                )
+            if lock_all:
+                translation_lock_mode[dmap[name]] = np.uint32(TRANSLATION_LOCK_ALL)
+                has_translation_lock = True
+            elif axis is not None:
                 translation_lock[dmap[name]] = np.asarray(axis, dtype=np.float32)
+                translation_lock_mode[dmap[name]] = np.uint32(TRANSLATION_LOCK_AXIS)
                 has_translation_lock = True
 
-        # ----- Lock Rotation: one normalized axis per dmap entry --------
-        # Same alignment as translation_lock above, and independent of
-        # it: an object may set either, both, or neither. Written to
-        # bin/rotation_lock.bin at export time.
+        # ----- Lock Rotation: one axis and one mode per dmap entry ------
+        # Same alignment, same axis-plus-mode reading and the same
+        # emptiness rule as translation_lock above, and independent of
+        # it: an object may set either family, both, or neither. Written
+        # to bin/rotation_lock.bin and bin/rotation_lock_mode.bin at
+        # export time.
         rotation_lock = np.zeros((concat_displacement.shape[0], 3), dtype=np.float32)
-        # ----- Lock Rotation mode: one uint32 per dmap entry ------------
-        # Aligned with rotation_lock above. 0 = allow-only or disabled,
-        # 1 = prohibit-axis. Written to bin/rotation_lock_mode.bin at
-        # export time, only when at least one object has Lock Rotation
-        # enabled (same emptiness condition as rotation_lock.bin).
         rotation_lock_mode = np.zeros((concat_displacement.shape[0],), dtype=np.uint32)
         has_rotation_lock = False
         for name, obj in dyn_objects:
             axis = getattr(obj, "_rotation_lock", None)
-            if axis is not None:
+            lock_all = bool(getattr(obj, "_rotation_lock_all", False))
+            if lock_all and axis is not None:
+                raise ValueError(
+                    f"object {name!r} carries both a Lock Rotation axis and "
+                    "Lock All Rotations; the two are mutually exclusive "
+                    "spellings of one lock and the last call must clear the other"
+                )
+            if lock_all:
+                rotation_lock_mode[dmap[name]] = np.uint32(ROTATION_LOCK_ALL)
+                has_rotation_lock = True
+            elif axis is not None:
                 rotation_lock[dmap[name]] = np.asarray(axis, dtype=np.float32)
                 rotation_lock_mode[dmap[name]] = np.uint32(
-                    1 if getattr(obj, "_rotation_lock_prohibit_axis", False) else 0
+                    ROTATION_LOCK_PROHIBIT_AXIS
+                    if getattr(obj, "_rotation_lock_prohibit_axis", False)
+                    else ROTATION_LOCK_ALLOW_ONLY
                 )
                 has_rotation_lock = True
 
@@ -2538,7 +2709,17 @@ class Scene:
             param: ParamHolder,
             concat_param: dict[str, list],
             count: int,
+            obj=None,
+            element_key: str = "F",
         ):
+            """Replicate one object's material across `count` elements.
+
+            `obj` is passed for the passes whose object carries an element
+            table a spatial map can be reduced over, which replaces the
+            replicated scalar with one value per element. `element_key` names
+            that table: "F" for triangles, "T" for tetrahedra. The rod pass
+            passes no object, because a rod has neither.
+            """
             param_keys = [k for k in param.key_list() if k not in per_body_only_keys]
             if len(concat_param.keys()):
                 assert param_keys == list(concat_param.keys()), (
@@ -2549,7 +2730,20 @@ class Scene:
                     continue
                 if key not in concat_param:
                     concat_param[key] = []
-                concat_param[key].extend([value] * count)
+                mapped = (
+                    obj.element_param_values(key, float(value), 0.0, element_key)
+                    if obj is not None and key in obj.param_spatial
+                    else None
+                )
+                if mapped is not None:
+                    assert len(mapped) == count, (
+                        f"spatial map for '{key}' produced {len(mapped)} "
+                        f"'{element_key}' values but the object contributes "
+                        f"{count} elements"
+                    )
+                    concat_param[key].extend(mapped.tolist())
+                else:
+                    concat_param[key].extend([value] * count)
 
         # Param replication must mirror the Rust kernel's element
         # layout in `concat_tri`: rods first, then pure shells, then
@@ -2564,21 +2758,91 @@ class Scene:
             if obj.obj_type == "rod" and rod_added:
                 _extend_param(obj.param, concat_rod_param, rod_added)
             if tet_added:
-                _extend_param(obj.param, concat_tet_param, tet_added)
+                _extend_param(
+                    obj.param, concat_tet_param, tet_added, obj, element_key="T"
+                )
+        # Animated material values replicate across an object's triangles in
+        # the SAME order as the static ones below, because the solver reads
+        # both as prefix-aligned per-triangle slots. Building them in a
+        # separate loop would be a second ordering to keep in step, so they
+        # are extended together.
+        param_anim_times = list(self._param_anim_times)
+        concat_tri_param_anim: dict[str, list[list[float]]] = {}
+
+        def _extend_param_anim(obj, count: int):
+            """Replicate one object's animated values across `count` triangles.
+
+            An object that animates nothing still has to contribute its CONSTANT
+            value to every frame of a key some other object animates, or the
+            per-triangle arrays would be short and the two objects' triangles
+            would be misaligned.
+            """
+            if not param_anim_times:
+                return
+            for key in (
+                concat_tri_param_anim.keys()
+                | obj.param_anim.keys()
+                | set(obj.animated_spatial_keys)
+            ):
+                frames = concat_tri_param_anim.setdefault(
+                    key, [[] for _ in param_anim_times]
+                )
+                values = obj.param_anim.get(key)
+                if values is None:
+                    static = float(obj.param.get(key))
+                    values = [static] * len(param_anim_times)
+                elif len(values) != len(param_anim_times):
+                    raise ValueError(
+                        f"animated '{key}' has {len(values)} values but the "
+                        f"scene has {len(param_anim_times)} keyframe times"
+                    )
+                for f, v in enumerate(values):
+                    # A key can be animated AND mapped: the schedule moves the
+                    # base, the map spreads each frame's base toward its target,
+                    # and the map's own weights can move too.
+                    mapped = (
+                        obj.element_param_values(
+                            key, float(v), param_anim_times[f]
+                        )
+                        if key in obj.param_spatial
+                        else None
+                    )
+                    if mapped is not None:
+                        frames[f].extend(mapped.tolist())
+                    else:
+                        frames[f].extend([v] * count)
+
+        # Every triangle-contributing object has to appear in every animated
+        # key's table, including the ones that animate nothing. Seeding the
+        # keys before the passes run is what makes that true regardless of the
+        # order the objects are visited in: a key first seen on the second
+        # object would otherwise miss the first object's triangles and leave
+        # the per-key array short.
+        if param_anim_times:
+            for name, obj in dyn_objects:
+                if not int(stats_by_name[name]["tri_added"]):
+                    continue
+                for key in obj.param_anim.keys() | set(obj.animated_spatial_keys):
+                    concat_tri_param_anim.setdefault(
+                        key, [[] for _ in param_anim_times]
+                    )
+
         # Pass A: pure shells.
         for name, obj in dyn_objects:
             stats = stats_by_name[name]
             tri_added = int(stats["tri_added"])
             tet_added = int(stats["tet_added"])
             if tri_added and tet_added == 0:
-                _extend_param(obj.param, concat_tri_param, tri_added)
+                _extend_param(obj.param, concat_tri_param, tri_added, obj)
+                _extend_param_anim(obj, tri_added)
         # Pass B: SOLID surface triangles (objects carrying both tri and tet).
         for name, obj in dyn_objects:
             stats = stats_by_name[name]
             tri_added = int(stats["tri_added"])
             tet_added = int(stats["tet_added"])
             if tri_added and tet_added:
-                _extend_param(obj.param, concat_tri_param, tri_added)
+                _extend_param(obj.param, concat_tri_param, tri_added, obj)
+                _extend_param_anim(obj, tri_added)
 
         # ----- SAND (faceless point cloud) scalar params -----
         # A "points" object has no elements, so the per-element replication
@@ -2682,6 +2946,46 @@ class Scene:
                 _collider_mask[np.asarray(map_by_name[name], dtype=np.int64)] = 1
         collider_vert_mask = _collider_mask if _collider_mask.any() else None
 
+        # Per-vertex source-object identity, the only thing that tells a
+        # SELF-intersection from an INTER-OBJECT one. It cannot be recovered
+        # downstream: `param_index` is deduplicated across objects, so two
+        # objects sharing a material share one index, and the statistics
+        # object index covers only the objects named in a statistics manifest
+        # (and only when the scene has one). Positions here are the same
+        # concatenated namespace `map_by_name` addresses, so every dynamic
+        # vertex is covered exactly once; the assert below is what keeps a
+        # future object kind from quietly leaving a gap that would then read
+        # as "same object" against everything else in it.
+        _object_index = np.full(len(concat_vert), np.iinfo(np.uint32).max,
+                                dtype=np.uint32)
+        for _oi, (name, _obj) in enumerate(dyn_objects):
+            _object_index[np.asarray(map_by_name[name], dtype=np.int64)] = _oi
+        _ungrouped = int(np.count_nonzero(_object_index == np.iinfo(np.uint32).max))
+        assert _ungrouped == 0, (
+            f"{_ungrouped} of {len(concat_vert)} dynamic vertices belong to no "
+            "object; the self- vs inter-object intersection test needs every "
+            "vertex mapped"
+        )
+        object_vert_index = _object_index
+
+        # Per-vertex intersection tolerances, resolved from each object's
+        # material. Resolved per OBJECT rather than replicated per element on
+        # purpose: that is the granularity the two params actually have, and
+        # it is the only one defined for a faceless SAND cloud, which has no
+        # element to hang a material on. `_scene_.py` drops both keys from
+        # concat_tet_param further down for the same reason a tet needs none:
+        # a solid is reached only through its surface triangles.
+        _policy = np.zeros(len(concat_vert), dtype=np.uint8)
+        for name, obj in dyn_objects:
+            bits = 0
+            if float(obj.param.get("allow-self-intersection")) != 0.0:
+                bits |= _INTERSECT_ALLOW_SELF
+            if float(obj.param.get("allow-inter-object-intersection")) != 0.0:
+                bits |= _INTERSECT_ALLOW_INTER_OBJECT
+            if bits:
+                _policy[np.asarray(map_by_name[name], dtype=np.int64)] = bits
+        intersect_policy = _policy if _policy.any() else None
+
         concat_pin: list[PinData] = [
             PinData(
                 index=np.asarray(map_by_name[name], dtype=np.int64)[
@@ -2698,6 +3002,7 @@ class Scene:
                 pin_group_id=p.pin_group_id,
                 hide_in_preview=bool(getattr(obj, "_is_static_moving", False)),
                 rest_shape_track=bool(getattr(p, "rest_shape_track", False)),
+                allow_intersection=bool(getattr(p, "allow_intersection", False)),
             )
             for name, obj in dyn_objects
             for p in obj.pin_list
@@ -2898,6 +3203,29 @@ class Scene:
         global_pinned_vertices: set[int] = set()
         for pin in concat_pin:
             global_pinned_vertices.update(pin.index)
+
+        # Which vertices are pinned by a pin that asked for its intersections
+        # to be tolerated (issue #138). A vertex can be covered by more than
+        # one pin and the answer must hold for EVERY one of them: an allowance
+        # says this vertex's placement is not the solver's to resolve, and a
+        # pin that made no such claim contradicts it. Starting from "no pin
+        # has spoken" also leaves an unpinned vertex false, which is what
+        # makes the element rule mean "all N vertices are pinned AND every pin
+        # covering them allows it". Mirrors the same reduction in
+        # `builder::build`, which is what the SOLVER reads; both have to grant
+        # the same set or a scene builds here and aborts there.
+        pin_allow_vertices = np.zeros(concat_count, dtype=bool)
+        _pin_seen = np.zeros(concat_count, dtype=bool)
+        for pin in concat_pin:
+            if not pin.index:
+                continue
+            idx = np.asarray(pin.index, dtype=np.int64)
+            allows = bool(getattr(pin, "allow_intersection", False))
+            fresh = ~_pin_seen[idx]
+            pin_allow_vertices[idx[fresh]] = allows
+            if not allows:
+                pin_allow_vertices[idx[~fresh]] = False
+            _pin_seen[idx] = True
 
         concat_rest_vert = concat_vert.copy()
         rest_vert_mask = np.zeros(concat_count, dtype=np.uint8)
@@ -3123,6 +3451,19 @@ class Scene:
         for key in ["friction", "contact-gap", "contact-offset", "bend",
                     "bending-damping"]:
             concat_tet_param[key] = []
+        # The two intersection allowances are per OBJECT, not per element:
+        # they are resolved above into the per-vertex `intersect_policy`
+        # array, which is what the solver and the build-time check both read.
+        # Nothing consumes a per-element copy, and leaving one in would reach
+        # the solver's element param loops and trip their "Unknown face
+        # parameter" panic, so every element kind drops them here. They still
+        # travel to the solver as the resolved policy, and they are still
+        # visible per object in the addon and in the PARAM payload.
+        for key in ["allow-self-intersection", "allow-inter-object-intersection"]:
+            concat_tri_param[key] = []
+            concat_rod_param[key] = []
+            concat_tet_param[key] = []
+            concat_static_param[key] = []
         for key in ["bend-plasticity", "bend-plasticity-threshold",
                     "bend-rest-from-geometry"]:
             concat_tet_param[key] = []
@@ -3198,9 +3539,16 @@ class Scene:
             ),
             rest_vert_anim=rest_vert_anim if has_rest_vert_anim else None,
             rest_vert_times=rest_vert_times if has_rest_vert_anim else None,
+            tri_param_anim=concat_tri_param_anim or None,
+            param_anim_times=param_anim_times or None,
             bend_rest_vert=concat_bend_rest_vert if has_bend_rest_vert else None,
             bend_rest_vert_mask=bend_rest_vert_mask if has_bend_rest_vert else None,
             collider_vert_mask=collider_vert_mask,
+            object_vert_index=object_vert_index,
+            intersect_policy=intersect_policy,
+            pin_allow_vertices=(
+                pin_allow_vertices if pin_allow_vertices.any() else None
+            ),
             pdrd_body_rows=pdrd_body_rows if pdrd_body_rows else None,
             pdrd_vert_index=pdrd_vert_index if next_body_id > 0 else None,
             pdrd_vert_list=pdrd_vert_list if next_body_id > 0 else None,
@@ -3208,6 +3556,9 @@ class Scene:
             sand_param=concat_sand_param if concat_sand_param else None,
             invisible_vert=invisible_vert if invisible_vert.any() else None,
             translation_lock=translation_lock if has_translation_lock else None,
+            translation_lock_mode=(
+                translation_lock_mode if has_translation_lock else None
+            ),
             rotation_lock=rotation_lock if has_rotation_lock else None,
             rotation_lock_mode=rotation_lock_mode if has_rotation_lock else None,
             statistics_objects=statistics_objects,

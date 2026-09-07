@@ -144,6 +144,52 @@ class OBJECT_UL_StaticOpsList(bpy.types.UIList):
         row.prop(item, "show_overlay", text="", icon=eye_icon, emboss=False)
 
 
+class OBJECT_UL_MaterialMapsList(UIList):
+    """UI List for a group's spatial material maps."""
+
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_property, index
+    ):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            from ...models.material_maps import base_property
+
+            row = layout.row(align=True)
+            row.prop(item, "enabled", text="")
+            # The parameter reads first because it is what the map means; the
+            # source is how it is authored. A parameter this group's elements
+            # do not read is drawn in alert color: the enum offers every map
+            # parameter, and only the encoder would otherwise report it.
+            param = row.row(align=True)
+            param.alert = base_property(item.parameter, data.object_type) is None
+            param.prop(item, "parameter", text="")
+            src = row.row(align=True)
+            src.alert = not item.source_name
+            src.prop(item, "source_name", text="", icon="GROUP_VERTEX")
+            if len(item.samples):
+                row.label(text=f"+{len(item.samples)}")
+            row.prop(item, "target_value", text="")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="")
+
+
+class OBJECT_UL_MaterialMapSamplesList(UIList):
+    """UI List for one material map's later weight sources."""
+
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_property, index
+    ):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+            row.label(text=f"Frame {item.frame}")
+            src = row.row(align=True)
+            src.alert = not item.source_name
+            src.prop(item, "source_name", text="", icon="GROUP_VERTEX")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="")
+
+
 class OBJECT_UL_MergePairsList(bpy.types.UIList):
     def draw_item(
         self, context, layout, data, item, icon, active_data, active_property, index
@@ -318,6 +364,8 @@ classes = (
     OBJECT_UL_PinOperationsList,
     OBJECT_UL_StaticOpsList,
     OBJECT_UL_MergePairsList,
+    OBJECT_UL_MaterialMapsList,
+    OBJECT_UL_MaterialMapSamplesList,
     SCENE_UL_DynParamsList,
     SCENE_UL_DynParamKeyframesList,
     SOLVER_UL_CheckpointFrames,

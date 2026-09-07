@@ -56,17 +56,18 @@ on:
         default: 'g6.xlarge'
         type: choice
         options:
-          # L4 (sm_89), minimal single-GPU current gen. T4/g4dn (sm_75)
-          # is intentionally absent: the shipped cubins are the ones listed
-          # in crates/ppf-cts-solver/src/cpp/cuda_arch.txt, none of which a
-          # T4 can run, so it would fail "named symbol not found".
+          # L4 (sm_89), minimal single-GPU current gen. g4dn (T4, sm_75)
+          # would now run too: the shipped cubins in
+          # crates/ppf-cts-solver/src/cpp/cuda_arch.txt include sm_75. It is
+          # left out here only because the Blender rig wants the faster card,
+          # not because the image lacks a kernel for it.
           - g6.xlarge
           - g6.2xlarge
           - g6e.2xlarge
       region:
         description: 'AWS Region'
         required: true
-        default: 'us-east-2'
+        default: 'ap-northeast-1'
         type: choice
         options:
           - us-east-1
@@ -249,8 +250,10 @@ jobs:
         # -I/usr/include/eigen3 on Linux (libeigen3-dev). install-blender.sh
         # installs Blender's own runtime deps + Xvfb separately.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libeigen3-dev build-essential
+          # DPkg::Lock::Timeout waits out unattended-upgrades on a freshly
+          # booted instance instead of failing the build on a held dpkg lock.
+          sudo apt-get -o DPkg::Lock::Timeout=300 update -qq
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends libeigen3-dev build-essential
 
       - name: Install Blender (Linux) + Xvfb
         run: |

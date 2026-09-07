@@ -379,9 +379,10 @@ struct RigidMap {
     Vec<Vec3f> jaxis;       // [n_bodies] world rotation axle per body (hinge)
     Vec<unsigned> tlock;    // compact translation-lock index, or RIGID_UNSET
     Vec<Vec3f> tlock_axis;  // world-space lock axis per body
+    Vec<unsigned> tlock_mode; // axis or all-axes mode per body
     Vec<unsigned> rlock;    // compact rotation-lock index, or RIGID_UNSET
     Vec<Vec3f> rlock_axis;  // world-space rotation-lock axis per body
-    Vec<unsigned> rlock_mode; // allow-only or prohibit-axis mode per body
+    Vec<unsigned> rlock_mode; // allow-only, prohibit-axis or all-axes per body
     bool any_translation_lock{false};
     bool any_rotation_lock{false};
     bool built{false};      // topology (vbody/cloth_off/jmode/jaxis) is populated
@@ -393,6 +394,7 @@ struct RigidMap {
         jaxis.free();
         tlock.free();
         tlock_axis.free();
+        tlock_mode.free();
         rlock.free();
         rlock_axis.free();
         rlock_mode.free();
@@ -414,6 +416,7 @@ inline void launch_project_bodies(const RigidMap &rm, Vec<float> &u) {
         const_cast<Vec<Vec3f> &>(rm.jaxis),
         const_cast<Vec<unsigned> &>(rm.tlock),
         const_cast<Vec<Vec3f> &>(rm.tlock_axis),
+        const_cast<Vec<unsigned> &>(rm.tlock_mode),
         const_cast<Vec<unsigned> &>(rm.rlock),
         const_cast<Vec<Vec3f> &>(rm.rlock_axis),
         const_cast<Vec<unsigned> &>(rm.rlock_mode), u);
@@ -511,6 +514,7 @@ inline void build_rigid_map(RigidMap &rm, const DataSet &data,
         rm.jaxis.free();
         rm.tlock.free();
         rm.tlock_axis.free();
+        rm.tlock_mode.free();
         rm.rlock.free();
         rm.rlock_axis.free();
         rm.rlock_mode.free();
@@ -518,6 +522,7 @@ inline void build_rigid_map(RigidMap &rm, const DataSet &data,
         rm.jaxis = Vec<Vec3f>::alloc(nb);
         rm.tlock = Vec<unsigned>::alloc(nb);
         rm.tlock_axis = Vec<Vec3f>::alloc(nb);
+        rm.tlock_mode = Vec<unsigned>::alloc(nb);
         rm.rlock = Vec<unsigned>::alloc(nb);
         rm.rlock_axis = Vec<Vec3f>::alloc(nb);
         rm.rlock_mode = Vec<unsigned>::alloc(nb);
@@ -571,6 +576,7 @@ inline void build_rigid_map(RigidMap &rm, const DataSet &data,
             std::vector<Vec3f> hjaxis(nb);
             std::vector<unsigned> htlock(nb, RIGID_UNSET);
             std::vector<Vec3f> htlock_axis(nb, Vec3f::Zero());
+            std::vector<unsigned> htlock_mode(nb, TRANSLATION_LOCK_AXIS);
             std::vector<unsigned> hrlock(nb, RIGID_UNSET);
             std::vector<Vec3f> hrlock_axis(nb, Vec3f::Zero());
             std::vector<unsigned> hrlock_mode(nb,
@@ -594,17 +600,25 @@ inline void build_rigid_map(RigidMap &rm, const DataSet &data,
                     }
                     const unsigned body = lock.pdrd_body_index - 1u;
                     assert(body < nb);
-                    if (lock.axis.squaredNorm() > 0.0f) {
+                    // Enablement is the MODE, not the axis: an all-axes lock
+                    // ships a zero axis, so an axis test would leave tlock or
+                    // rlock at RIGID_UNSET and silently drop the lock while
+                    // the UI still showed it as set.
+                    if (translation_lock_enabled(lock)) {
                         assert(htlock[body] == RIGID_UNSET);
+                        assert(lock.translation_mode == TRANSLATION_LOCK_AXIS ||
+                               lock.translation_mode == TRANSLATION_LOCK_ALL);
                         htlock[body] = li;
                         htlock_axis[body] = lock.axis;
+                        htlock_mode[body] = lock.translation_mode;
                         rm.any_translation_lock = true;
                     }
-                    if (lock.rotation_axis.squaredNorm() > 0.0f) {
+                    if (rotation_lock_enabled(lock)) {
                         assert(hrlock[body] == RIGID_UNSET);
                         assert(lock.rotation_mode == ROTATION_LOCK_ALLOW_ONLY ||
                                lock.rotation_mode ==
-                                   ROTATION_LOCK_PROHIBIT_AXIS);
+                                   ROTATION_LOCK_PROHIBIT_AXIS ||
+                               lock.rotation_mode == ROTATION_LOCK_ALL);
                         hrlock[body] = li;
                         hrlock_axis[body] = lock.rotation_axis;
                         hrlock_mode[body] = lock.rotation_mode;
@@ -624,6 +638,10 @@ inline void build_rigid_map(RigidMap &rm, const DataSet &data,
             CUDA_HANDLE_ERROR(cudaMemcpy(rm.tlock_axis.data,
                                          htlock_axis.data(),
                                          nb * sizeof(Vec3f),
+                                         cudaMemcpyHostToDevice));
+            CUDA_HANDLE_ERROR(cudaMemcpy(rm.tlock_mode.data,
+                                         htlock_mode.data(),
+                                         nb * sizeof(unsigned),
                                          cudaMemcpyHostToDevice));
             CUDA_HANDLE_ERROR(cudaMemcpy(rm.rlock.data, hrlock.data(),
                                          nb * sizeof(unsigned),

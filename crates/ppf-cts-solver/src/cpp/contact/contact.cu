@@ -24,6 +24,7 @@
 #include "contact.hpp"
 #include "distance.hpp"
 #include "intersect_core.hpp"
+#include "intersect_policy.hpp"
 #include <cassert>
 
 namespace accd {
@@ -307,8 +308,21 @@ __device__ void embed_contact_force_hess(
     }
 
     Vec3f ex_fp = ex;
-    assert(ex0.squaredNorm() > sqr(offset));
-    assert(ex_fp.squaredNorm() > sqr(offset));
+    // Both separations must clear the offset for this pair to have a barrier at
+    // all: `normal` below normalizes ex_fp, and compute_edge_gradient/hessian
+    // divide by the gap the offset opens. A pair that arrives already collapsed
+    // to the offset (a scene admitted with an intersection allowance is the way
+    // this happens in practice, but nothing here consults the allowance) has no
+    // defined normal, so contribute nothing and report the pair instead. The
+    // host ends the advance with a structured OverlappingStart naming these two
+    // vertices; see accd::report_contact_overlap for why this is not an assert.
+    const float ex0_d2 = ex0.squaredNorm();
+    const float ex_d2 = ex_fp.squaredNorm();
+    if (!(ex0_d2 > sqr(offset)) || !(ex_d2 > sqr(offset))) {
+        accd::report_contact_overlap(prox.index[0], prox.index[N - 1], 6u,
+                                     fminf(ex0_d2, ex_d2), offset);
+        return;
+    }
 
     Vec3f dx = ex - ex0;
     if (wsum) {
@@ -530,7 +544,10 @@ struct PointPointContactForceHessEmbed {
                     count = 1u;
                 }
                 if (count) {
-                    assert(e.squaredNorm() > sqr(offset));
+                    // The separation guard for this pair lives in embed_contact_force_hess,
+                    // which recomputes exactly this quantity from prox and reports the pair
+                    // rather than trapping. Asserting it again here would fire first and
+                    // trap the device before that report could be made.
                     Proximity<2> prox;
                     prox.index = Vec2u(vertex_index, index);
                     prox.value = Vec2f(1.0f, -1.0f);
@@ -706,7 +723,10 @@ struct PointEdgeContactForceHessEmbed {
                         count = 1u;
                     }
                     if (count) {
-                        assert(e.squaredNorm() > sqr(offset));
+                        // The separation guard for this pair lives in embed_contact_force_hess,
+                        // which recomputes exactly this quantity from prox and reports the pair
+                        // rather than trapping. Asserting it again here would fire first and
+                        // trap the device before that report could be made.
                         Proximity<3> prox;
                         prox.index = Vec3u(vertex_index, f[0], f[1]);
                         prox.value = Vec3f(1.0f, -c[0], -c[1]);
@@ -784,7 +804,10 @@ struct PointFaceContactForceHessEmbed {
                 float ghat = 0.5f * (vparam.ghat + fparam.ghat);
                 float friction = combine_friction(vparam.friction, fparam.friction, param.friction_mode);
                 if (e.squaredNorm() < sqr(ghat + offset)) {
-                    assert(e.squaredNorm() > sqr(offset));
+                    // The separation guard for this pair lives in embed_contact_force_hess,
+                    // which recomputes exactly this quantity from prox and reports the pair
+                    // rather than trapping. Asserting it again here would fire first and
+                    // trap the device before that report could be made.
                     Proximity<4> prox;
                     prox.index = Vec4u(vertex_index, f[0], f[1], f[2]);
                     prox.value = Vec4f(1.0f, -c[0], -c[1], -c[2]);
@@ -863,7 +886,10 @@ struct EdgeEdgeContactForceHessEmbed {
                 float friction =
                     combine_friction(eparam_edge.friction, eparam_index.friction, param.friction_mode);
                 if (e.squaredNorm() < sqr(ghat + offset)) {
-                    assert(e.squaredNorm() > sqr(offset));
+                    // The separation guard for this pair lives in embed_contact_force_hess,
+                    // which recomputes exactly this quantity from prox and reports the pair
+                    // rather than trapping. Asserting it again here would fire first and
+                    // trap the device before that report could be made.
                     Proximity<4> prox;
                     prox.index = Vec4u(e0[0], e0[1], e1[0], e1[1]);
                     prox.value = Vec4f(c[0], c[1], -c[2], -c[3]);
@@ -937,7 +963,17 @@ struct CollisionMeshVertexFaceContactForceHessEmbed_M2C {
             float friction =
                 combine_friction(dyn_vparam.friction, static_fparam.friction, param.friction_mode);
             if (e.squaredNorm() < sqr(offset + ghat)) {
-                assert(e.squaredNorm() > sqr(offset));
+                // `e.normalized()` just below is a 0/0 normalize once the separation
+                // reaches the offset, and gap_squared collapses with it. Report the
+                // pair and contribute nothing, so the host ends the advance with a
+                // named OverlappingStart. An assert would report on only one
+                // of the two shipped builds, since NDEBUG is absent from the
+                // cargo CUDA build and present in the Windows one.
+                if (!(e.squaredNorm() > sqr(offset))) {
+                    accd::report_contact_overlap(vertex_index, fc[0], 7u,
+                                                 e.squaredNorm(), offset);
+                    return true;
+                }
                 Vec3f normal = e.normalized();
                 float mass = dyn_vert_prop[vertex_index].mass;
                 Vec3f proj_x = y + normal * (offset + ghat);
@@ -1006,7 +1042,17 @@ struct CollisionMeshVertexFaceContactForceHessEmbed_C2M {
             float friction =
                 combine_friction(dyn_fparam.friction, static_vparam.friction, param.friction_mode);
             if (e.squaredNorm() < sqr(offset + ghat)) {
-                assert(e.squaredNorm() > sqr(offset));
+                // `e.normalized()` just below is a 0/0 normalize once the separation
+                // reaches the offset, and gap_squared collapses with it. Report the
+                // pair and contribute nothing, so the host ends the advance with a
+                // named OverlappingStart. An assert would report on only one
+                // of the two shipped builds, since NDEBUG is absent from the
+                // cargo CUDA build and present in the Windows one.
+                if (!(e.squaredNorm() > sqr(offset))) {
+                    accd::report_contact_overlap(fc[0], vertex_index, 8u,
+                                                 e.squaredNorm(), offset);
+                    return true;
+                }
                 Vec3f normal = e.normalized();
                 Mat9x9f local_hess = Mat9x9f::Zero();
                 float gap_squared = sqr(e.norm() - offset);
@@ -1103,7 +1149,17 @@ struct CollisionMeshEdgeEdgeContactForceHessEmbed {
             float friction =
                 combine_friction(dyn_eparam.friction, static_eparam.friction, param.friction_mode);
             if (e.squaredNorm() < sqr(offset + ghat)) {
-                assert(e.squaredNorm() > sqr(offset));
+                // `e.normalized()` just below is a 0/0 normalize once the separation
+                // reaches the offset, and gap_squared collapses with it. Report the
+                // pair and contribute nothing, so the host ends the advance with a
+                // named OverlappingStart. An assert would report on only one
+                // of the two shipped builds, since NDEBUG is absent from the
+                // cargo CUDA build and present in the Windows one.
+                if (!(e.squaredNorm() > sqr(offset))) {
+                    accd::report_contact_overlap(mesh_edge[0], coll_edge[0], 9u,
+                                                 e.squaredNorm(), offset);
+                    return true;
+                }
                 Vec3f normal = e.normalized();
                 Vec3f proj_x = (offset + ghat) * normal;
                 Vec6f normal_ext;
@@ -2759,6 +2815,11 @@ __device__ bool edge_triangle_intersect(const Vec3f &a0, const Vec3f &a1,
     return ppf_isect::edge_triangle_intersect<float>(e0a, e1a, zero, d1a, d2a);
 }
 
+// The intersection allowances of issue #138 are decided by
+// `ppf_isect::intersection_tolerated` (contact/intersect_policy.hpp), which the
+// four intersect testers below and the emulator's host detector share. See that
+// header for the rule and its reasoning.
+
 class EdgeEdgeIntersectTester {
   public:
     __device__
@@ -2805,7 +2866,12 @@ class EdgeEdgeIntersectTester {
             // Excluded whether the two sides are one collider or two.
             bool both_collider =
                 vert_prop[e0[0]].collider && vert_prop[e1[0]].collider;
-            if (either_dyn && either_nonzero && !same_pdrd_body && !both_collider) {
+            bool tolerated = ppf_isect::intersection_tolerated(
+                vert_prop[e0[0]], vert_prop[e1[0]],
+                prop[edge_index].pin_allow_intersection,
+                prop[index].pin_allow_intersection);
+            if (either_dyn && either_nonzero && !same_pdrd_body &&
+                !both_collider && !tolerated) {
                 const EdgeParam &eparam_edge =
                     edge_params[prop[edge_index].param_index];
                 const EdgeParam &eparam_index =
@@ -2919,7 +2985,12 @@ class FaceEdgeIntersectTester {
         // Excluded whether the two sides are one collider or two.
         bool both_collider =
             vert_prop[edge[edge_index][0]].collider && vert_prop[face[index][0]].collider;
-        if (either_dyn && either_nonzero && !same_pdrd_body && !both_collider) {
+        bool tolerated = ppf_isect::intersection_tolerated(
+            vert_prop[face[index][0]], vert_prop[edge[edge_index][0]],
+            face_prop[index].pin_allow_intersection,
+            edge_prop[edge_index].pin_allow_intersection);
+        if (either_dyn && either_nonzero && !same_pdrd_body && !both_collider &&
+            !tolerated) {
             Vec3u f = face[index];
             unsigned e0 = edge[edge_index][0];
             unsigned e1 = edge[edge_index][1];
@@ -2952,6 +3023,14 @@ class FaceEdgeIntersectTester {
     unsigned *record_counter;
 };
 
+// A DYNAMIC edge against the rest-pose STATIC collision mesh, which is a
+// disjoint contact-only pool outside the solved namespace. The pair is
+// therefore inter-object by construction and carries no self-intersection
+// case, and the collision mesh has no material and no pins of its own, so the
+// verdict rests entirely on the dynamic edge: the static side is handed
+// NO_OBJECT_INDEX and an empty policy, under which
+// `ppf_isect::intersection_tolerated`'s "either side opts in" reduces to "the
+// dynamic side opted in".
 class CollisionMeshFaceEdgeIntersectTester {
   public:
     __device__ CollisionMeshFaceEdgeIntersectTester(const Vec<Vec3f> &vertex,
@@ -2959,12 +3038,16 @@ class CollisionMeshFaceEdgeIntersectTester {
                                                     const Vec3f &y0,
                                                     const Vec3f &y1,
                                                     unsigned edge_index,
+                                                    bool tolerated,
                                                     IntersectionRecord *records,
                                                     unsigned *record_counter)
         : vertex(vertex), face(face), y0(y0), y1(y1),
-          edge_index(edge_index), records(records),
+          edge_index(edge_index), tolerated(tolerated), records(records),
           record_counter(record_counter) {}
     __device__ bool operator()(unsigned index) {
+        if (tolerated) {
+            return false;
+        }
         Vec3u f = face[index];
         const Vec3f &x0 = vertex[f[0]];
         const Vec3f &x1 = vertex[f[1]];
@@ -2982,6 +3065,7 @@ class CollisionMeshFaceEdgeIntersectTester {
     const Vec<Vec3u> &face;
     Vec3f y0, y1;
     unsigned edge_index;
+    bool tolerated;
     IntersectionRecord *records;
     unsigned *record_counter;
 };
@@ -3025,7 +3109,14 @@ class PointPointIntersectTester {
             // Excluded whether the two sides are one collider or two.
             bool both_collider =
                 vert_prop[vertex_index].collider && vert_prop[index].collider;
-            if (either_dyn && either_nonzero && !same_pdrd_body && !both_collider) {
+            // A grain IS its own element, so its all-N-vertices-pinned bit is
+            // just its own.
+            bool tolerated = ppf_isect::intersection_tolerated(
+                vert_prop[vertex_index], vert_prop[index],
+                vert_prop[vertex_index].pin_allow_intersection,
+                vert_prop[index].pin_allow_intersection);
+            if (either_dyn && either_nonzero && !same_pdrd_body &&
+                !both_collider && !tolerated) {
                 const VertexParam &vp_a =
                     vertex_params[vert_prop[vertex_index].param_index];
                 const VertexParam &vp_b =
@@ -3113,9 +3204,17 @@ bool check_intersection(const DataSet &data, const Vec<Vec3f> &vertex,
         // Zero-mass edges (static solids, incl. moving-static shells)
         // never intersect the collision mesh (itself a static solid).
         if (data.prop.edge[i].mass > 0.0f) {
+            // The static side has no object identity, no material policy and
+            // no pins, so it is described by a default-constructed prop; the
+            // dynamic edge alone decides.
+            VertexProp static_side = {};
+            static_side.object_index = NO_OBJECT_INDEX;
+            bool tolerated_2 = ppf_isect::intersection_tolerated(
+                data.prop.vertex[mesh.mesh.edge[i][0]], static_side,
+                data.prop.edge[i].pin_allow_intersection, false);
             CollisionMeshFaceEdgeIntersectTester tester_2(
                 collision_mesh_vertex, collision_mesh_face, y0, y1, i,
-                records_vec.data, counter_vec.data);
+                tolerated_2, records_vec.data, counter_vec.data);
             AABB_AABB_Tester<CollisionMeshFaceEdgeIntersectTester> op_2(tester_2);
             if (aabb::query(collision_mesh_face_bvh, collision_mesh_face_aabb, op_2,
                             aabb)) {

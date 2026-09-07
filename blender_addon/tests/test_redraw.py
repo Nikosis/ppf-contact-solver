@@ -52,8 +52,10 @@ def _mock_event(event_type="TIMER"):
 
 def _fake_connect_op(**overrides):
     """Build a fake REMOTE_OT_Connect-shaped self. modal() only reads
-    `_connection_established`, `_timer`, `_start_time`, `timeout`, and
-    calls `self.report(...)`."""
+    `_connection_established`, `_timer`, `_start_time`, `timeout`, calls
+    `self.report(...)`, and tears the timer down through
+    `_detach_timer`, which is bound to the real implementation so the
+    teardown every exit path depends on is exercised too."""
     base = dict(
         _connection_established=False,
         _timer=None,
@@ -62,7 +64,11 @@ def _fake_connect_op(**overrides):
         report=lambda *a, **kw: None,
     )
     base.update(overrides)
-    return types.SimpleNamespace(**base)
+    ns = types.SimpleNamespace(**base)
+    ns._detach_timer = types.MethodType(
+        connection_ops_mod.REMOTE_OT_Connect._detach_timer, ns
+    )
+    return ns
 
 
 def _fake_async_op(**overrides):
@@ -79,6 +85,13 @@ def _fake_async_op(**overrides):
         on_complete=lambda c: None,
         on_timeout=lambda c: None,
         report=lambda *a, **kw: None,
+        # Staged pre-work hooks. modal() reads _stages on every tick and
+        # calls _end_stages on both cancel paths, so a fake without them
+        # raises AttributeError before reaching the assertion and the
+        # test passes no judgement on the code it names. None means "no
+        # stages", which is the shape these redraw tests want.
+        _stages=None,
+        _end_stages=lambda: None,
     )
     base.update(overrides)
     return types.SimpleNamespace(**base)
@@ -88,16 +101,21 @@ def _fake_async_op(**overrides):
 # REMOTE_OT_Connect.modal() ordering race
 # ---------------------------------------------------------------------------
 
-def test_connect_modal_fast_success_before_cancel_check():
-    """Regression: fast connect (phase -> ONLINE before first tick)
-    must be detected as success, not misread as cancellation."""
-    op = _fake_connect_op()
+def test_connect_modal_finishes_once_connected():
+    """A fast connect (phase -> ONLINE before the first tick) must be
+    detected as success, not misread as cancellation, and the operator
+    must FINISH there rather than hold a modal handler open for the
+    connection's lifetime. Blender skips auto-save while any modal
+    handler is attached, so a resident modal here costs the user every
+    recovery file for the session (issue #145)."""
+    op = _fake_connect_op(_timer=object())
     with mock.patch.object(com, "is_connected", return_value=True), \
          mock.patch.object(com, "is_connecting", return_value=False), \
          mock.patch.object(connection_ops_mod, "redraw_all_areas") as redraw:
         result = connection_ops_mod.REMOTE_OT_Connect.modal(op, _mock_context(), _mock_event())
-    assert result == {"PASS_THROUGH"}, f"expected PASS_THROUGH, got {result!r}"
+    assert result == {"FINISHED"}, f"expected FINISHED, got {result!r}"
     assert op._connection_established is True, "fast-success transition missed"
+    assert op._timer is None, "modal finished without releasing its event timer"
     assert redraw.called, "redraw_all_areas was not called on success transition"
 
 
@@ -586,20 +604,22 @@ def test_watcher_observes_server_launch_transition():
 def test_connect_modal_reaches_established_after_connected_transition():
     """End-to-end on the Connect flow: simulate phase transition through
     the state machine, wire is_connected() to the resulting phase, invoke
-    the modal — the fast-success fix must mark _connection_established."""
+    the modal. It must mark _connection_established and then hand the
+    connection over by finishing, leaving no modal handler attached."""
     connecting = AppState(phase=Phase.CONNECTING)
     online, _ = transition(connecting, Connected(remote_root="/r"))
     assert online.phase == Phase.ONLINE  # precondition
 
-    op = _fake_connect_op()
+    op = _fake_connect_op(_timer=object())
     # After the Connected event, com.is_connected() == True and
     # com.is_connecting() == False.
     with mock.patch.object(com, "is_connected", return_value=True), \
          mock.patch.object(com, "is_connecting", return_value=False), \
          mock.patch.object(connection_ops_mod, "redraw_all_areas") as redraw:
         result = connection_ops_mod.REMOTE_OT_Connect.modal(op, _mock_context(), _mock_event())
-    assert result == {"PASS_THROUGH"}
+    assert result == {"FINISHED"}
     assert op._connection_established is True
+    assert op._timer is None
     assert redraw.called
 
 

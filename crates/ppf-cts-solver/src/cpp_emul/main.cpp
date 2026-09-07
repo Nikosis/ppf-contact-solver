@@ -13,6 +13,14 @@
 //     it to result.time, sleeps PPF_EMULATED_STEP_MS so the test rig
 //     can observe BUSY/RUNNING transitions, and runs the optional
 //     PPF_EMULATED_FAIL_AT_FRAME fault-injection branch.
+//   * initialize() and advance() DO run a real edge-triangle intersection
+//     scan over the current pose (intersection.hpp), applying the same pair
+//     filters as the device tester. It is the only physics-adjacent thing
+//     the emulator computes for real, and it exists so the issue-#138
+//     intersection allowances have a CUDA-free acceptance gate. It is a
+//     pose scan, not a sweep: with no Newton loop the emulator never moves a
+//     free vertex, so what it reports is what the pins and the optional
+//     elastic step produced.
 //   * update_constraint() takes over the role the kernel plays in
 //     production: kinematic FixPair positions are written directly
 //     into the device-side vertex.curr buffer so the next fetch()
@@ -33,6 +41,7 @@
 // emulated_intersection, time-bump+sleep) live here now.
 
 #include "../cpp/data.hpp"
+#include "intersection.hpp"
 #include "mem.hpp"
 #include "pd_arap.hpp"
 #include "sand.hpp"
@@ -110,10 +119,6 @@ std::vector<IntersectionRecord> g_synthetic_records;
 
 constexpr unsigned TRANSLATION_LOCK_UNSET = 0xffffffffu;
 
-bool lock_axis_enabled(const Vec3f &axis) {
-    return axis[0] != 0.0f || axis[1] != 0.0f || axis[2] != 0.0f;
-}
-
 Vec3f lock_perpendicular(const Vec3f &value, const Vec3f &axis) {
     const float along =
         value[0] * axis[0] + value[1] * axis[1] + value[2] * axis[2];
@@ -147,20 +152,34 @@ void validate_translation_locks(const DataSet &data) {
                    std::abs(norm - 1.0f) <=
                        64.0f * std::numeric_limits<float>::epsilon();
         };
-        const bool translation_enabled =
-            lock.axis[0] != 0.0f || lock.axis[1] != 0.0f ||
-            lock.axis[2] != 0.0f;
-        const bool rotation_enabled =
-            lock.rotation_axis[0] != 0.0f ||
-            lock.rotation_axis[1] != 0.0f ||
-            lock.rotation_axis[2] != 0.0f;
-        if ((!translation_enabled && !rotation_enabled) ||
+        // An all-axes half names no direction, so its axis is required to be
+        // exactly zero and a stale one is a second spelling of the same
+        // record. Refusing it here keeps the emulator's copy of the rule as
+        // strict as the Rust loader's.
+        const auto axis_canonical = [](const Vec3f &axis, bool all_mode) {
+            return !all_mode ||
+                   (axis[0] == 0.0f && axis[1] == 0.0f && axis[2] == 0.0f);
+        };
+        // THE MODE CARRIES THE ENABLE BIT, NOT THE AXIS: an all-axes half is
+        // on with a zero axis, which an axis test reads as off while the UI
+        // still reports the lock as set. These are the shared predicates from
+        // data.hpp, the only spelling of the question anywhere.
+        const bool translation_enabled = translation_lock_enabled(lock);
+        const bool rotation_enabled = rotation_lock_enabled(lock);
+        // One list of admissible modes, shared with the constraint builder
+        // that consumes them, so a mode added to one cannot be missing here.
+        const bool modes_valid =
+            pd_arap::translation_lock_mode_valid(lock.translation_mode) &&
+            pd_arap::rotation_lock_mode_valid(lock.rotation_mode);
+        if ((!translation_enabled && !rotation_enabled) || !modes_valid ||
             !valid_axis(lock.axis) || !valid_axis(lock.rotation_axis) ||
-            (lock.rotation_mode != ROTATION_LOCK_ALLOW_ONLY &&
-             lock.rotation_mode != ROTATION_LOCK_PROHIBIT_AXIS) ||
+            !axis_canonical(lock.axis,
+                            lock.translation_mode == TRANSLATION_LOCK_ALL) ||
+            !axis_canonical(lock.rotation_axis,
+                            lock.rotation_mode == ROTATION_LOCK_ALL) ||
             !std::isfinite(lock.total_mass) || lock.total_mass <= 0.0f) {
             ppf_fatal(PPF_FATAL_SOLVER_INVARIANT,
-                      "PPF FATAL: aggregate lock %u has invalid axis or "
+                      "PPF FATAL: aggregate lock %u has invalid axis, mode or "
                       "physical mass.\n",
                       lock.dmap_index);
         }
@@ -193,14 +212,19 @@ void project_translation_locks(DataSet &data) {
             continue;
         }
         const TranslationLock &lock = data.translation_lock.data[li];
-        if (!lock_axis_enabled(lock.axis)) {
+        if (!translation_lock_enabled(lock)) {
             continue;
         }
         const float mass = data.prop.vertex.data[v].mass;
         const Vec3f delta =
             (data.vertex.curr.data[v] - data.translation_lock_initial.data[v])
                 .cast<float>();
-        const Vec3f d = lock_perpendicular(delta, lock.axis);
+        // TRANSLATION_LOCK_ALL holds the whole point, so the whole
+        // displacement is drift. An axis mode leaves the component along its
+        // axis free and corrects only what is perpendicular to it.
+        const Vec3f d = lock.translation_mode == TRANSLATION_LOCK_ALL
+                            ? delta
+                            : lock_perpendicular(delta, lock.axis);
         drift[li] += mass * d;
         const bool is_fixed = data.prop.vertex.data[v].fix_index > 0 &&
                               data.prop.vertex.data[v].pdrd_body_index == 0;
@@ -209,7 +233,7 @@ void project_translation_locks(DataSet &data) {
         }
     }
     for (unsigned li = 0; li < nl; ++li) {
-        if (!lock_axis_enabled(data.translation_lock.data[li].axis)) {
+        if (!translation_lock_enabled(data.translation_lock.data[li])) {
             continue;
         }
         const Vec3f required = drift[li];
@@ -219,7 +243,7 @@ void project_translation_locks(DataSet &data) {
                 ppf_fatal(PPF_FATAL_SOLVER_INVARIANT,
                           "PPF FATAL: translation lock group %u is infeasible "
                           "because fixed vertices leave no free mass for its "
-                          "perpendicular COM correction.\n",
+                          "COM correction.\n",
                           data.translation_lock.data[li].dmap_index);
             }
             continue;
@@ -362,6 +386,20 @@ extern "C" DLL_EXPORT bool initialize(DataSet *dataset, ParamSet *param) {
     g_dev_dataset = build_dev_mirror(*dataset);
     g_param = param;
     g_advance_count.store(0);
+    // Same gate the CUDA backend applies at initialize: a scene that starts
+    // tangled is refused, unless one of the issue-#138 allowances covers the
+    // pair. `disable_contact` turns the whole reporting path off there, so it
+    // does here too.
+    if (param && !param->disable_contact) {
+        if (!emul_isect::check(g_dev_dataset, g_synthetic_records)) {
+            ppf_fatal_set_detail(
+                "the scene is already self-intersecting at t=0; the solver "
+                "advances from a separated configuration and cannot untangle "
+                "one, so the geometry has to be authored apart");
+            g_ppf_fatal_code = PPF_FATAL_INIT_INTERSECTION;
+            return false;
+        }
+    }
     return true;
 }
 
@@ -404,6 +442,18 @@ extern "C" DLL_EXPORT void advance(StepResult *result) {
 
     if (!elastic_advanced && !sand_advanced) {
         project_translation_locks(g_dev_dataset);
+    }
+
+    // Live scan of the pose the step just produced, after the movers, since
+    // they are what can create a new intersection. Same sense and same gate as
+    // the CUDA path's post-step check: it lowers `intersection_free` rather
+    // than aborting, so the host decides what a mid-run intersection means.
+    // The fault-injection branch above may already have lowered the flag; do
+    // not raise it back.
+    if (g_param && !g_param->disable_contact) {
+        if (!emul_isect::check(g_dev_dataset, g_synthetic_records)) {
+            result->intersection_free = false;
+        }
     }
 
     if (g_param) {
@@ -591,6 +641,24 @@ extern "C" DLL_EXPORT void update_constraint(const Constraint *constraint) {
     if (hinge_prop.size > 0) {
         mem::copy_to_device(hinge_prop, g_dev_dataset.prop.hinge);
     }
+}
+
+extern "C" DLL_EXPORT void update_material_params(const MaterialParamUpdate *update) {
+    // The emulated backend keeps one host-side dataset, so the frame's face
+    // table is copied straight in. pd_arap reads mu out of it, which is what
+    // lets an animated stiffness be checked without a GPU.
+#define PPF_COPY_PARAM_TABLE(field)                                            \
+    if (update->field.size && g_dev_dataset.param_arrays.field.data) {         \
+        for (unsigned i = 0; i < update->field.size &&                         \
+                             i < g_dev_dataset.param_arrays.field.size; ++i) { \
+            g_dev_dataset.param_arrays.field.data[i] = update->field.data[i];  \
+        }                                                                      \
+    }
+    PPF_COPY_PARAM_TABLE(face)
+    PPF_COPY_PARAM_TABLE(vertex)
+    PPF_COPY_PARAM_TABLE(edge)
+    PPF_COPY_PARAM_TABLE(hinge)
+#undef PPF_COPY_PARAM_TABLE
 }
 
 extern "C" DLL_EXPORT void update_rest_shape(const RestShapeUpdate *update) {

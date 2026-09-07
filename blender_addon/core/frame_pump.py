@@ -9,6 +9,17 @@
 # State PropertyGroup, modifier.cache_format, scene.frame_start, etc.).
 # The addon's persistent bpy.app.timers tick is NOT permissive and
 # therefore cannot drive these writes.
+#
+# The operator runs only while it has work, and MUST NOT become
+# resident. Blender refuses to auto-save while any modal operator handler
+# is attached to a window: its auto-save timer re-arms itself for another
+# 10 ms instead of writing, for as long as such a handler exists. A pump
+# that stays up for the addon's lifetime therefore defers auto-save
+# forever, and the user gets no recovery file for the whole session
+# while the addon is merely enabled. work_pending() is the single
+# predicate deciding both when to start and when to finish.
+
+import time
 
 import bpy  # pyright: ignore
 from bpy.types import Operator  # pyright: ignore
@@ -23,6 +34,17 @@ _pump_error_reported: set[str] = set()
 # first tick heals immediately.
 _heal_tick_counter = 0
 _HEAL_EVERY_N_TICKS = 10
+
+# A heal pass owed to the scene: requested when the addon registers and
+# whenever a .blend is loaded, since Blender cancels every modal
+# operator on file load and the pump is not resident to notice.
+_heal_requested = False
+
+# How long the modal keeps running after its work is gone. Without it a
+# momentary idle between two stages of one solve would tear the modal
+# down and rebuild it on the next 0.25s tick. Auto-save pays nothing for
+# this: its retry cadence is 10 ms against an interval of minutes.
+_IDLE_LINGER_S = 1.0
 
 
 def _log_pump_error(msg: str) -> None:
@@ -46,15 +68,59 @@ def _clear_stop() -> None:
     _pump_stop_requested = False
 
 
+def request_heal() -> None:
+    """Ask for one MESH_CACHE heal pass, starting the pump if needed.
+
+    The heal is what rebinds a ContactSolverCache the scene lost, so it
+    has to run once after the addon registers and once after every file
+    load. Both are moments when no solve is in flight, which is exactly
+    when the pump is otherwise absent.
+    """
+    global _heal_requested
+    _heal_requested = True
+
+
+def work_pending() -> bool:
+    """True when something needs a modal-operator context.
+
+    Three sources: a requested heal, an engine that is not idle (a solve
+    building, running, fetching or applying), and frames still queued for
+    apply_animation. The last one is separate from the second because a
+    solve can return the state machine to idle while its final frames are
+    still waiting in the runner's buffer.
+
+    Both ensure_modal_running and the modal itself read this, so the
+    start and stop conditions cannot drift apart.
+    """
+    if _heal_requested:
+        return True
+    try:
+        from .facade import _engine_is_idle, communicator
+        if not _engine_is_idle():
+            return True
+        return communicator.has_pending_animation_frames()
+    except Exception as e:
+        # Half-built facade during register or teardown. Report it and
+        # keep the pump running: a spurious tick costs a deferred
+        # auto-save, while a pump that refuses to start drops frames.
+        _log_pump_error(f"work_pending failed, assuming work: {e}")
+        return True
+
+
 class PPF_OT_FramePump(Operator):
     """Internal modal that applies simulation frames and heals broken
-    MESH_CACHE modifiers. Runs for the entire lifetime of the addon."""
+    MESH_CACHE modifiers.
+
+    Started on demand and finished as soon as work_pending() has been
+    false for _IDLE_LINGER_S, so that an idle scene carries no modal
+    handler and Blender can auto-save."""
 
     bl_idname = "ppf.frame_pump"
     bl_label = "PPF Frame Pump (internal)"
     bl_options = {"INTERNAL"}
 
     _timer = None
+    _idle_since = 0.0
 
     def execute(self, context):
         # Reset so the first tick after a (re)start always heals once,
@@ -62,6 +128,7 @@ class PPF_OT_FramePump(Operator):
         # engine is idle (periodic heal is otherwise skipped at rest).
         global _heal_tick_counter
         _heal_tick_counter = 0
+        self._idle_since = 0.0
         self._timer = context.window_manager.event_timer_add(
             0.1, window=context.window
         )
@@ -111,42 +178,84 @@ class PPF_OT_FramePump(Operator):
             # arriving) or once right after the modal (re)starts to catch a
             # post-load/reload teardown. On a fully idle scene it is
             # skipped entirely, so an at-rest scene costs ~0 here.
-            global _heal_tick_counter
+            global _heal_tick_counter, _heal_requested
             run_heal = _heal_tick_counter == 0
             if not run_heal and _heal_tick_counter % _HEAL_EVERY_N_TICKS == 0:
                 from .facade import _engine_is_idle
                 run_heal = not _engine_is_idle()
             if run_heal:
                 heal_mesh_caches_if_stale()
+                # Settled by the pass above. Cleared after the call
+                # rather than before so the debt cannot go missing
+                # between the request and the work it asks for.
+                _heal_requested = False
             _heal_tick_counter += 1
             apply_animation()
         except Exception as e:
             _log_pump_error(str(e))
+        if self._idle_expired():
+            self._detach_timer(context)
+            return {"FINISHED"}
         return {"PASS_THROUGH"}
 
+    def _idle_expired(self) -> bool:
+        """True once work_pending() has been false for _IDLE_LINGER_S.
 
-def ensure_modal_running():
-    """Spawn the frame-pump modal if no live instance exists. Called
-    both from the register-time kickoff timer and from the persistent
-    Blender tick, so the modal self-heals after file-open, scene change
-    or reload events that cancel it. Cheap early-out when one is
-    already running."""
+        Finishing is what lets Blender auto-save again, so this is the
+        whole point of the operator being non-resident; see the module
+        comment.
+        """
+        if work_pending():
+            self._idle_since = 0.0
+            return False
+        now = time.monotonic()
+        if self._idle_since == 0.0:
+            self._idle_since = now
+            return False
+        return now - self._idle_since >= _IDLE_LINGER_S
+
+
+def ensure_modal_running() -> str:
+    """Spawn the frame-pump modal if work is pending and no live
+    instance exists. Called both from the register-time kickoff timer
+    and from the persistent Blender tick, so the modal starts whenever a
+    solve, a queued frame or a requested heal needs a modal-operator
+    context, and is absent the rest of the time so Blender can auto-save.
+
+    The work_pending() gate sits before the heap walk below on purpose:
+    at rest that walk would otherwise scan every Python object four
+    times a second for a pump that has nothing to do.
+
+    Returns the decision it reached, one of ``stopped``, ``unregistered``,
+    ``no-work``, ``already-running``, ``started`` or ``error``. Callers
+    ignore it; it is what makes the gate observable to a test, since
+    whether a spawn happened is otherwise only visible through the event
+    loop, which no synchronous caller can advance.
+    """
     import gc
     if _pump_stop_requested:
-        return
+        return "stopped"
     if getattr(bpy.types, "PPF_OT_frame_pump", None) is None:
-        return
+        return "unregistered"
+    if not work_pending():
+        return "no-work"
     for obj in gc.get_objects():
         if type(obj).__name__ == "PPF_OT_FramePump" and getattr(obj, "_timer", None) is not None:
-            return
+            return "already-running"
     try:
         bpy.ops.ppf.frame_pump("INVOKE_DEFAULT")
     except Exception as e:
         print(f"frame pump ensure: {e}")
+        return "error"
+    return "started"
 
 
 def _kickoff_modal():
     _clear_stop()
+    # Owed unconditionally: this is the addon's one chance to rebind a
+    # ContactSolverCache in a .blend that was already open when the
+    # addon was enabled, and it is also what starts the pump at all.
+    request_heal()
     ensure_modal_running()
     return None  # one-shot
 

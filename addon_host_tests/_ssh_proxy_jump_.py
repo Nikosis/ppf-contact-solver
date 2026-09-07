@@ -27,7 +27,7 @@ import pytest
 
 CONFIG_TEXT = """
 Host gpu-host
-    HostName 10.0.0.5
+    HostName 192.0.2.5
     User ubuntu
     IdentityFile ~/.ssh/id_gpu
     ProxyJump inner
@@ -45,7 +45,7 @@ Host outer
     User outer-user
 
 Host direct-host
-    HostName 10.0.0.9
+    HostName 192.0.2.9
     ProxyJump none
 
 Host loop-a
@@ -81,7 +81,7 @@ def test_proxyjump_is_read_from_the_config(ssh_config, config_path):
     """The keyword reaches the resolved entry, and its absence reads as None
     rather than as an empty jump that would be dialed."""
     entry = ssh_config.resolve_ssh_config("gpu-host", 22, config_path)
-    assert entry.hostname == "10.0.0.5"
+    assert entry.hostname == "192.0.2.5"
     assert entry.proxy_jump == "inner"
     assert ssh_config.resolve_ssh_config("outer", 22, config_path).proxy_jump is None
 
@@ -110,9 +110,9 @@ def test_hop_written_by_hand_outranks_the_config(ssh_config, config_path):
 
 
 def test_comma_separated_hops_stay_in_order(ssh_config, config_path):
-    assert chain(ssh_config, config_path, "outer,admin@10.0.0.7:2022") == [
+    assert chain(ssh_config, config_path, "outer,admin@192.0.2.7:2022") == [
         ("outer.example.com", 2201, "outer-user", None),
-        ("10.0.0.7", 2022, "admin", None),
+        ("192.0.2.7", 2022, "admin", None),
     ]
 
 

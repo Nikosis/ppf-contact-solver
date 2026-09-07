@@ -191,10 +191,11 @@ def transition(state: AppState, event: Event) -> tuple[AppState, list[Effect]]:
         case Disconnected():
             return _reset_state(state), []
 
-        case ConnectionLost():
+        case ConnectionLost(cause=cause):
+            message = f"Connection lost: {cause}" if cause else "Connection lost."
             return (
-                _reset_state(state, error="Connection lost."),
-                [DoClearAnimation(), DoLog("Connection lost.")],
+                _reset_state(state, error=message),
+                [DoClearAnimation(), DoLog(message)],
             )
 
         # ── Server lifecycle ───────────────────────────────
@@ -743,17 +744,23 @@ def _interpret_response(
         # user actually intended to run. DoStopServer routes through the
         # current backend (local/win_native: subprocess.terminate;
         # ssh/docker: pkill -f ppf-cts-server on the remote).
+        # The two version numbers are the whole diagnosis, so they go on the
+        # panel as well as into the Console. A restart is the fix only when
+        # the on-disk binary is already the matching one; a solver that came
+        # as a Docker image or a Windows bundle carries its version with it,
+        # and for those the only fix is to update whichever side is behind,
+        # so the message has to name that rather than just say restart.
+        mismatch = (
+            f"Protocol version mismatch: server reports {version}, add-on "
+            f"expects {PROTOCOL_VERSION}. The server is being stopped so a "
+            f"restart picks up the on-disk binary. If it reports the same "
+            f"version again, the two halves are different releases: update "
+            f"the add-on, or pull the solver image or Windows bundle that "
+            f"matches it."
+        )
         return (
-            replace(state, version_ok=False),
-            [
-                DoLog(
-                    f"Protocol version mismatch: server reports {version}, "
-                    f"addon expects {PROTOCOL_VERSION}. Stopping the server "
-                    f"so a fresh restart picks up the on-disk binary; "
-                    f"update the older side if the mismatch persists."
-                ),
-                DoStopServer(),
-            ],
+            replace(state, version_ok=False, error=mismatch),
+            [DoLog(mismatch), DoStopServer()],
         )
 
     # upload_id is mandatory in the current wire protocol; absence

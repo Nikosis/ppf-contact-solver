@@ -221,6 +221,36 @@ struct VertexProp {
     // when the collider is held by springs instead and its vertices become
     // free. Field order must mirror `VertexProp` in data.rs (repr(C) ABI).
     bool collider;
+    // Source-object identity, the only thing that separates a SELF-
+    // intersection from an INTER-OBJECT one. `param_index` cannot serve:
+    // identical materials deduplicate to one entry, so two objects share it.
+    // Read off an element's FIRST vertex, the convention `pdrd_body_index` and
+    // `collider` already use, which holds because a vertex belongs to exactly
+    // one object and therefore so does every element built on it.
+    // NO_OBJECT_INDEX when the session directory carries no object_vert.bin.
+    unsigned object_index;
+    // This vertex's object's intersection tolerances, as
+    // INTERSECT_ALLOW_SELF | INTERSECT_ALLOW_INTER_OBJECT. Resolved per OBJECT
+    // by the frontend rather than per element, which is both the granularity
+    // the material param has and the only one defined for a faceless SAND
+    // grain (no incident element to read a material from).
+    unsigned char intersect_policy;
+    // Every pin covering this vertex asked for its intersections to be
+    // tolerated. False for an unpinned vertex, so an element earns the
+    // exemption only when ALL of its vertices carry this. Latched at scene
+    // build, exactly like FaceProp::fixed.
+    bool pin_allow_intersection;
+};
+
+// VertexProp::object_index for a vertex whose source object is unknown.
+// Deliberately not 0: two unknown indices must not compare equal, or every
+// such pair would read as a self-intersection and take that allowance.
+enum : unsigned { NO_OBJECT_INDEX = 0xFFFFFFFFu };
+
+// VertexProp::intersect_policy bits. Mirrored in data.rs.
+enum : unsigned char {
+    INTERSECT_ALLOW_SELF = 1u << 0,
+    INTERSECT_ALLOW_INTER_OBJECT = 1u << 1,
 };
 
 struct EdgeProp {
@@ -229,6 +259,11 @@ struct EdgeProp {
     float mass;
     bool fixed;
     unsigned param_index;
+    // All of this edge's vertices are pinned by pins that asked for their
+    // intersections to be tolerated. Precomputed from
+    // VertexProp::pin_allow_intersection the way `fixed` is precomputed from
+    // fix_index. Field order must mirror Rust EdgeProp in data.rs.
+    bool pin_allow_intersection;
 };
 
 struct FaceProp {
@@ -250,6 +285,9 @@ struct FaceProp {
     // order must mirror Rust FaceProp in data.rs (repr(C) ABI).
     bool collider;
     unsigned param_index;
+    // All of this face's vertices are pinned by pins that asked for their
+    // intersections to be tolerated. See EdgeProp::pin_allow_intersection.
+    bool pin_allow_intersection;
 };
 
 struct HingeProp {
@@ -408,6 +446,11 @@ struct FixPair {
     float ghat;
     unsigned index;
     bool kinematic;
+    // The pin that placed this vertex asked for its intersections to be
+    // tolerated. Consumed once, at scene build, to latch
+    // VertexProp::pin_allow_intersection; the per-step constraint rebuild
+    // carries it along so the two constructions cannot disagree.
+    bool allow_intersection;
     // NOTE: every fix pin is an exact Dirichlet BC (main.cu eliminates its DOF),
     // so there is no per-pin stiffness to scale: there is no penalty force left.
     // `ghat` and `kinematic` survive only for the PDRD anchor, the one pin still
@@ -419,6 +462,11 @@ struct PullPair {
     Vec3f position;
     float weight;
     unsigned index;
+    // See FixPair::allow_intersection. A pull pin holds its vertex only to the
+    // extent of its own force, so an intersection under one is often not
+    // something the pin is responsible for; that is the case issue #138
+    // singles out. Field order must mirror Rust PullPair in data.rs.
+    bool allow_intersection;
 };
 
 struct TorqueGroup {
@@ -512,6 +560,22 @@ struct RestShapeUpdate {
     Vec<unsigned char> exclude_tet;
 };
 
+/// Per-frame material tables. Only the face table varies today: the hinge,
+/// edge and vertex tables are derived from the faces at build, so animating a
+/// key that reaches them needs that derivation re-run and the host refuses
+/// such a schedule until it exists. Field order must mirror Rust
+/// MaterialParamUpdate in data.rs (repr(C) ABI).
+struct MaterialParamUpdate {
+    Vec<FaceParam> face;
+    // Derived from the faces at build (a hinge averages its two, an edge or
+    // vertex averages its neighbors), so a frame that changes the faces changes
+    // these as well. Field order must mirror Rust MaterialParamUpdate in
+    // data.rs (repr(C) ABI).
+    Vec<VertexParam> vertex;
+    Vec<EdgeParam> edge;
+    Vec<HingeParam> hinge;
+};
+
 struct ParamSet {
     double time;
     float air_friction;
@@ -599,20 +663,39 @@ struct VertexSet {
     Vec<Vec3f> curr;
 };
 
-enum RotationLockMode : unsigned {
-    ROTATION_LOCK_ALLOW_ONLY = 0u,
-    ROTATION_LOCK_PROHIBIT_AXIS = 1u,
+enum TranslationLockMode : unsigned {
+    // The center of mass stays on the line through its initial value along
+    // `axis` (two rows).
+    TRANSLATION_LOCK_AXIS = 0u,
+    // The center of mass stays at its initial point (three rows).
+    TRANSLATION_LOCK_ALL = 1u,
 };
 
-// Mirror of Rust TranslationLock. `axis` is the optional normalized
-// solver-space translation direction and `rotation_axis` is the optional
-// normalized rotation direction. `rotation_mode` selects allow-only or
-// prohibit-axis semantics. A zero rotation axis disables that component. The
-// `anchor` lets the rotation projector form every relative coordinate as a
-// position difference against a fixed reference rather than from an absolute
-// position. Field order must mirror Rust data.rs (repr(C) ABI).
+enum RotationLockMode : unsigned {
+    // Rotation about `rotation_axis` is the only angular freedom (two rows).
+    ROTATION_LOCK_ALLOW_ONLY = 0u,
+    // Rotation about `rotation_axis` is forbidden, the perpendicular plane
+    // stays free (one row).
+    ROTATION_LOCK_PROHIBIT_AXIS = 1u,
+    // There is no net rotation about any axis (three rows).
+    ROTATION_LOCK_ALL = 2u,
+};
+
+// Mirror of Rust TranslationLock. Each half is a mode beside an axis, and THE
+// MODE CARRIES THE ENABLE BIT. In an axis mode the axis is a normalized
+// solver-space direction and a zero axis means that half is off; in an
+// all-axes mode the axis is meaningless and is exactly zero, asserted on the
+// Rust side so a record has one canonical spelling. Testing `axis != 0`
+// directly is therefore wrong for the all-axes modes: use
+// translation_lock_enabled() / rotation_lock_enabled() from
+// solver/translation_lock.hpp. Zero is the off value for both modes, so a
+// session written without the lock bins is an unlocked scene. The `anchor`
+// lets the rotation projector form every relative coordinate as a position
+// difference against a fixed reference rather than from an absolute position.
+// Field order must mirror Rust data.rs (repr(C) ABI).
 struct TranslationLock {
     Vec3f axis;
+    unsigned translation_mode;
     float total_mass;
     unsigned pdrd_body_index;
     unsigned dmap_index;
@@ -620,6 +703,37 @@ struct TranslationLock {
     unsigned rotation_mode;
     Vec3f anchor;
 };
+
+// The record is memcpy'd raw between Rust and the device at six sites, and
+// nothing else compares the two layouts. A field added on one side only would
+// otherwise reinterpret total_mass, pdrd_body_index or anchor as garbage and
+// still compile clean on both sides. `data.rs` asserts the same number.
+static_assert(sizeof(TranslationLock) == 56,
+              "TranslationLock must stay layout-identical to its repr(C) Rust "
+              "mirror in data.rs; update both or neither");
+
+// ONE definition of "this lock component is on", shared by the CUDA deformable
+// projector, the PDRD reduced projector and the emulator.
+//
+// The mode carries the enable bit, NOT the axis. An axis-mode component is on
+// exactly when its axis is nonzero; an all-axes component has no axis at all
+// (it is required to be exactly zero) and is on by its mode alone. Testing the
+// axis directly therefore reads every all-axes lock as disabled while the UI
+// still reports it as set, which is silent and produces no wrong number to
+// notice, so the axis test does not exist anywhere as a spelling of this
+// question.
+__device__ __host__ inline bool
+translation_lock_enabled(const TranslationLock &lock) {
+    return lock.translation_mode == TRANSLATION_LOCK_ALL ||
+           lock.axis[0] != 0.0f || lock.axis[1] != 0.0f || lock.axis[2] != 0.0f;
+}
+
+__device__ __host__ inline bool
+rotation_lock_enabled(const TranslationLock &lock) {
+    return lock.rotation_mode == ROTATION_LOCK_ALL ||
+           lock.rotation_axis[0] != 0.0f || lock.rotation_axis[1] != 0.0f ||
+           lock.rotation_axis[2] != 0.0f;
+}
 
 struct DataSet {
     VertexSet vertex;

@@ -139,11 +139,16 @@ def install_module(packages):
 
             # capture_output drains both pipes via communicate(), so the
             # child can't deadlock filling an undrained OS pipe buffer.
-            # check=True raises on a nonzero exit (caught below like the
-            # pip step's failure path).
+            #
+            # The return code is checked by hand rather than with
+            # ``check=True``: CalledProcessError stringifies as
+            # "Command '[...]' returned non-zero exit status 1." and carries
+            # none of the child's stderr, and stderr is where every failure
+            # worth naming lives (a read-only Python install, a stripped
+            # ensurepip, a proxy). This is the message the recovery button
+            # shows, so it has to carry that text.
             ensurepip_result = subprocess.run(
                 [sys.executable, "-m", "ensurepip", "--upgrade"],
-                check=True,
                 capture_output=True,
                 text=True,
             )
@@ -151,6 +156,13 @@ def install_module(packages):
                 console.write(ensurepip_result.stdout.strip())
             if ensurepip_result.stderr:
                 console.write(ensurepip_result.stderr.strip())
+            if ensurepip_result.returncode != 0:
+                detail = (ensurepip_result.stderr or ensurepip_result.stdout or "").strip()
+                raise RuntimeError(
+                    "Could not bootstrap pip (ensurepip exited "
+                    f"{ensurepip_result.returncode})"
+                    + (f": {detail}" if detail else "")
+                )
 
             process = subprocess.Popen(
                 [sys.executable, "-m", "pip", "install", "--target", target_path]

@@ -345,6 +345,17 @@ class EffectRunner:
 
     # -- animation buffer access (called from main thread) --
 
+    def has_pending_animation_frames(self) -> bool:
+        """True while frames wait to be applied (main thread).
+
+        The frame-pump modal reads this to decide whether it still has
+        work: a solve can leave its last frames queued after the state
+        machine has already returned to idle, and those frames need a
+        modal-operator context to be applied.
+        """
+        with self._anim_lock:
+            return bool(self._anim_frames)
+
     def take_one_animation_frame(self) -> tuple[tuple | None, dict, dict, bytes | None, int, int]:
         """Pop one pending frame (main thread)."""
         with self._anim_lock:
@@ -453,7 +464,7 @@ class EffectRunner:
                 if self._backend and not self._backend.is_alive():
                     from .events import ConnectionLost
                     console.write(f"Connection lost: {e}")
-                    self._engine.dispatch(ConnectionLost())
+                    self._engine.dispatch(ConnectionLost(cause=str(e)))
                     with self._io_lock:
                         self._cmd_queue.clear()
                         self._poll_slot = None
@@ -608,11 +619,15 @@ class EffectRunner:
             # main repo checkout) OR bin/ (a distributable bundle); accept
             # either, matching the spawn path's probe so a valid bundle root
             # isn't spuriously rejected here after connect.
-            from .connection import win_native_server_binary
+            from .connection import (
+                win_native_not_found_message,
+                win_native_server_binary,
+            )
             if win_native_server_binary(directory) is None:
-                expected = os.path.join(directory, "target", "release", "ppf-cts-server.exe")
+                # Same sentence the launch path raises, so the user is not
+                # told two different things about one missing binary.
                 self._engine.dispatch(ErrorOccurred(
-                    error=f"Remote path not found ({expected}).",
+                    error=win_native_not_found_message(directory),
                     source="validate_path",
                 ))
             return
@@ -904,22 +919,45 @@ class EffectRunner:
             self._response_cache.clear()
             self._engine.dispatch(ServerStopped())
             return
-        # SSH / Docker remote: match the Rust server binary by name so
-        # pkill targets the actual listener. Without this the loop
-        # would spin for its full grace and the addon would think stop
-        # succeeded only because it dispatched ServerStopped at the
-        # end.
+        # SSH / Docker remote: match the Rust server binary so pkill targets
+        # the actual listener.
+        #
+        # ``-x`` against the process NAME, not ``-f`` against the whole
+        # command line. ``exec_command(shell=True)`` runs this inside
+        # ``/bin/sh -c '...'``, whose own command line contains the pattern,
+        # so a ``-f`` match includes the shell issuing it and the stop can
+        # kill itself before reaching the server. The binary is named
+        # ``ppf-cts-server``, 14 characters, inside the 15-character limit a
+        # bare name match carries.
         self._backend.exec_command(
-            "pkill -f ppf-cts-server",
+            "pkill -x ppf-cts-server",
             shell=True,
         )
-        # Wait for server to actually stop
+        # Wait for the server to actually stop.
+        alive = True
         for _ in range(5):
-            response, alive = self._backend.query({}, self._project_name or "", self._chunk_size)
+            _response, alive = self._backend.query(
+                {}, self._project_name or "", self._chunk_size
+            )
             if not alive:
                 break
             time.sleep(0.25)
         self._response_cache.clear()
+        if alive:
+            # Still answering after the grace period. ServerStopped is
+            # dispatched anyway so the panel is not left wedged mid-stop, and
+            # the next background poll will find the server and correct the
+            # state; what must not happen is that the user is told the stop
+            # worked when the only evidence available says it did not.
+            self._engine.dispatch(ErrorOccurred(
+                error=(
+                    "Stop Server: the solver is still answering on port "
+                    f"{self._backend.server_port}. Check that the process is "
+                    f"reachable from the container or host the add-on is "
+                    f"driving."
+                ),
+                source="stop_server",
+            ))
         self._engine.dispatch(ServerStopped())
 
     def _do_send_data(self, remote_path: str, data: bytes) -> None:
@@ -996,9 +1034,16 @@ class EffectRunner:
         if not self._backend or not self._project_name:
             return 0
         try:
-            # win_native: the output dir is on this machine's local disk.
-            # cmd.exe has no `ls`, so glob directly.
-            if self._backend.backend_type == "win_native":
+            # Both LOCAL-disk backends read the output dir off this
+            # machine, so glob it rather than shelling out. `local` belongs
+            # here as much as `win_native` does: cmd.exe has no `ls`, so on
+            # Windows the shell-out below exits non-zero and this returns 0
+            # frames, which the caller cannot tell apart from a solve that
+            # produced none. The fetch then applies nothing, no mesh cache is
+            # attached, and the failure surfaces far from its cause. Globbing
+            # is also the cheaper of the two on POSIX, where it is what the
+            # shell would have done anyway.
+            if self._backend.backend_type in ("win_native", "local"):
                 import glob
                 output_dir = os.path.join(root, "session", "output")
                 names = [

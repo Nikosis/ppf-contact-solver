@@ -836,6 +836,28 @@ def set_group_material_properties(group_uuid: str, properties: dict):
     so halving length_factor also makes the rod about four times stiffer in
     bending.
 
+    Intersection allowances (accepted on every group type: SOLID, SHELL, ROD,
+    PDRD, SAND, STATIC). The value is applied to every object assigned to the
+    group, and self versus inter-object is decided per Blender object, not per
+    group:
+
+    - allow_self_intersection: an overlap of one object with itself is
+      simulated instead of reported, so a run starts and keeps going through a
+      pose that object is tangled in. An overlap between two objects assigned
+      to the same group is an inter-object pair, which this key does not cover.
+    - allow_inter_object_intersection: the same for an overlap between two
+      different objects, including two objects of this group. Either side is
+      enough, so setting it on a garment also covers the body it is fitted to.
+
+    On a STATIC group both keys reach the solver whenever the collider is part
+    of the solved scene, which covers an animated collider, a soft-constrained
+    one, and one named as a cross-stitch endpoint: each of those decodes to a
+    pin shell whose vertices carry the policy. A collider that is none of them
+    stays a contact-only collision mesh, its vertices carry no object id and an
+    empty policy, and a pair involving it is tolerated only when the opposing
+    dynamic side opts in. Contact and CCD are unaffected; only the report is
+    suppressed.
+
     Contact properties (mutually exclusive modes):
 
     - Absolute mode: contact_gap, contact_offset (sets use_group_bounding_box_diagonal=False)
@@ -896,6 +918,8 @@ def set_group_material_properties(group_uuid: str, properties: dict):
                 "bend_plasticity_threshold",
                 "bend_rest_angle_source",
                 "bend_rest_from_reference",
+                "allow_self_intersection",
+                "allow_inter_object_intersection",
                 "contact_gap",
                 "contact_offset",
                 "contact_gap_rat",
@@ -915,6 +939,8 @@ def set_group_material_properties(group_uuid: str, properties: dict):
                 "enable_plasticity",
                 "plasticity",
                 "plasticity_threshold",
+                "allow_self_intersection",
+                "allow_inter_object_intersection",
                 "contact_gap",
                 "contact_offset",
                 "contact_gap_rat",
@@ -939,6 +965,8 @@ def set_group_material_properties(group_uuid: str, properties: dict):
                 "bend_plasticity_threshold",
                 "bend_rest_angle_source",
                 "bend_rest_from_reference",
+                "allow_self_intersection",
+                "allow_inter_object_intersection",
                 "contact_gap",
                 "contact_offset",
                 "contact_gap_rat",
@@ -949,6 +977,8 @@ def set_group_material_properties(group_uuid: str, properties: dict):
                 "friction",
                 "enable_soft_constraint",
                 "soft_constraint_stiffness",
+                "allow_self_intersection",
+                "allow_inter_object_intersection",
                 "contact_gap",
                 "contact_offset",
                 "contact_gap_rat",
@@ -959,6 +989,8 @@ def set_group_material_properties(group_uuid: str, properties: dict):
                 "pdrd_density",
                 "friction",
                 "stitch_stiffness",
+                "allow_self_intersection",
+                "allow_inter_object_intersection",
                 "contact_gap",
                 "contact_offset",
                 "contact_gap_rat",
@@ -969,6 +1001,8 @@ def set_group_material_properties(group_uuid: str, properties: dict):
                 "sand_grain_radius",
                 "sand_particle_mass",
                 "sand_friction",
+                "allow_self_intersection",
+                "allow_inter_object_intersection",
                 "contact_gap",
                 "contact_offset",
                 "contact_gap_rat",

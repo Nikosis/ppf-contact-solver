@@ -233,6 +233,14 @@ class PinData:
     # the dynamic body's stress-free shape follows the deformation instead of
     # fighting it. Only meaningful for pull pins on SOLID/SHELL groups.
     rest_shape_track: bool = False
+    # This pin asks for the intersections of the elements it FULLY covers to
+    # be tolerated rather than reported (issue #138). An element qualifies
+    # only when every one of its vertices is pinned and every pin covering
+    # those vertices set this, so a partially pinned band is unaffected. Both
+    # pin modes carry it: a FIX pin's placement is prescribed and not the
+    # solver's to resolve, and a PULL pin holds only to the extent of its own
+    # force, which is the case the issue singles out.
+    allow_intersection: bool = False
 
 
 def _nested_bezier_handles(op_or_handles):
@@ -335,6 +343,7 @@ def _pin_to_toml_dict(pin: "PinData") -> dict:
         "pull_strength": float(pin.pull_strength),
         "unpin_time": float(pin.unpin_time) if pin.unpin_time is not None else None,
         "pin_group_id": pin.pin_group_id if pin.pin_group_id else None,
+        "allow_intersection": bool(pin.allow_intersection),
         "ops": [_pin_op_to_toml_dict(op) for op in pin.operations],
     }
 
@@ -814,6 +823,12 @@ class PinHolder:
         """Whether this pull holder drives a time-varying rest shape from a
         captured deformation (see ``PinData.rest_shape_track``)."""
         return self._data.rest_shape_track
+
+    @property
+    def allow_intersection(self) -> bool:
+        """Whether this pin asks for the intersections of the elements it
+        fully covers to be tolerated (see ``PinData.allow_intersection``)."""
+        return self._data.allow_intersection
 
     @property
     def transition(self) -> str:

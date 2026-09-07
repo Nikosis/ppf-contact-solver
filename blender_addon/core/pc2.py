@@ -353,19 +353,59 @@ def _cache_insertion_index(obj) -> int:
     (e.g. a Set Position wave) is treated as a deformer so PC2 wins on
     display instead of the GN re-deforming the cache output on top of
     itself.
+
+    That vertex-count question costs a depsgraph ``to_mesh()``, so it is
+    asked only once a NODES modifier is actually reached.
+    :func:`cache_placement_is_stale` calls this on every frame-pump tick,
+    and a stack carrying no Geometry Nodes has no use for the answer.
     """
-    nodes_are_deformers = _stack_preserves_vertex_count(obj)
+    nodes_are_deformers = None
     pos = 0
     for m in obj.modifiers:
         if m.name == MODIFIER_NAME:
             continue
         is_boundary = m.type in _GENERATIVE_MODIFIER_TYPES
-        if m.type == "NODES" and nodes_are_deformers:
-            is_boundary = False
+        if is_boundary and m.type == "NODES":
+            if nodes_are_deformers is None:
+                nodes_are_deformers = _stack_preserves_vertex_count(obj)
+            is_boundary = not nodes_are_deformers
         if is_boundary:
             return pos
         pos += 1
     return pos
+
+
+def cache_placement_is_stale(obj, place_after_deformers) -> bool:
+    """True when *obj* carries a ContactSolverCache sitting at an index
+    other than the one *place_after_deformers* asks for.
+
+    Placement is decided when the cache is BOUND, and a bind happens only
+    on the first frame written to a PC2 that is not already on disk. A
+    stack that gains a deformer after that (an Armature added, or an
+    existing one un-muted, once a solve has run) keeps its cache above the
+    deformer, and re-running does not correct it: the PC2 file is still
+    there, so the frame write takes the append path and never rebinds.
+    MESH_CACHE replays in OVERWRITE mode, so the deformer then re-applies
+    its deformation on top of the solver output that already carries it,
+    and every driven vertex moves twice. ``heal_mesh_caches_if_stale``
+    tests this so the next frame-pump tick re-places the modifier.
+
+    The verdict must match what :func:`setup_mesh_cache_modifier` would do
+    with the same flag, across BOTH of its branches: index 0 when the
+    caller wants the cache first, ``_cache_insertion_index`` otherwise.
+    """
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return False
+    mods = getattr(obj, "modifiers", None)
+    if mods is None or len(mods) < 2:
+        # A stack holding nothing but the cache has one arrangement, and
+        # it is the one both branches ask for.
+        return False
+    idx = mods.find(MODIFIER_NAME)
+    if idx < 0:
+        return False
+    target = _cache_insertion_index(obj) if place_after_deformers else 0
+    return idx != target
 
 
 def _cache_visibility_paths():
@@ -665,25 +705,143 @@ def has_mesh_cache(obj):
     return False
 
 
-def scene_has_solver_cache() -> bool:
-    """Fast, stateless: True when any object carries solver animation.
+def assigned_uuids_in_active_groups(scene) -> "set[str]":
+    """UUIDs of every object assigned to an ACTIVE object group.
 
-    A ``ContactSolverCache`` MESH_CACHE modifier is only ever placed on a
-    solver-managed (assigned) object, and removing an object from a group
-    strips it (see ``cleanup_mesh_cache``), so scanning every object's
-    modifiers is equivalent to a per-active-group scan in practice. Curves
-    keep their cache in the in-memory ``_curve_cache`` instead of a modifier.
-
-    Used by panel ``poll()`` methods that run on every UI redraw. Reading
-    ``obj.modifiers`` is a C-level collection lookup, so this whole scan is
-    ~100x cheaper than resolving each assigned object by UUID (which dominated
-    redraw time on large scenes) -- and it recomputes every call, so it never
-    goes stale the way a memoized result can.
+    This is exactly the set ``core.animation.clear_animation_data`` walks,
+    including entries whose ``included`` flag is off, which that function
+    clears as well. Reads the stored UUID strings directly instead of
+    resolving each entry to its object: ``resolve_assigned`` reconciles
+    display names on a rename, which writes RNA, and the callers here run
+    from ``poll()`` and panel draw where writes are not permitted.
     """
+    from ..models.groups import iterate_active_object_groups
+
+    return _assigned_uuids(scene, iterate_active_object_groups)
+
+
+def assigned_uuids_in_any_group(scene) -> "set[str]":
+    """UUIDs assigned to ANY object group, active or not.
+
+    The complement of this set is what :func:`find_orphan_solver_caches`
+    calls an orphan. Deactivating a group must not turn its objects into
+    orphans: the user is holding a second setup aside, not abandoning it.
+    """
+    from ..models.groups import iterate_object_groups
+
+    return _assigned_uuids(scene, iterate_object_groups)
+
+
+def _assigned_uuids(scene, iterate_groups) -> "set[str]":
+    uids: set[str] = set()
+    if scene is None:
+        return uids
+    for group in iterate_groups(scene):
+        for assigned in group.assigned_objects:
+            uid = getattr(assigned, "uuid", "")
+            if uid:
+                uids.add(str(uid))
+    return uids
+
+
+def find_orphan_solver_caches(scene=None) -> list:
+    """Objects carrying a ``ContactSolverCache`` that no group claims.
+
+    Duplicating a simulated object copies the modifier, and the depsgraph
+    handler strips the copy's inherited UUID, so the copy ends up owning a
+    cache while belonging to no group at all. Every gate in the addon
+    ignores it, by design (see :func:`scene_has_solver_cache`): it must
+    never disable Run, and Clear Local Animation must not reach across
+    into it. But ignoring it silently leaves an addon-created modifier in
+    the user's scene, usually with a filepath that resolves to nothing,
+    which Blender itself reports as a modifier error. The panel names what
+    this finds and offers to remove it, so the state is visible and
+    fixable rather than invisible and permanent.
+
+    Membership is tested against EVERY group, not the active ones, so a
+    deactivated setup's caches are never called orphans. An object with no
+    UUID at all cannot be assigned to anything, so it is an orphan as soon
+    as it carries the modifier.
+
+    Read-only, and called from panel draw: no UUID is stamped, no file is
+    touched, and the group set is built only once a modifier is found.
+    """
+    if scene is None:
+        scene = bpy.context.scene
+    uids = None
+    orphans = []
     for obj in bpy.data.objects:
-        if obj.modifiers.get(MODIFIER_NAME) is not None:
+        if obj.modifiers.get(MODIFIER_NAME) is None:
+            continue
+        if uids is None:
+            uids = assigned_uuids_in_any_group(scene)
+        if object_pc2_key_readonly(obj) not in uids:
+            orphans.append(obj)
+    return orphans
+
+
+def remove_orphan_solver_cache(obj) -> bool:
+    """Strip an orphaned ``ContactSolverCache`` from *obj*, keeping its PC2.
+
+    Returns True when a modifier was actually removed. The visibility
+    keyframes go first, as in :func:`cleanup_mesh_cache`, since they name
+    the modifier by data path and would linger as broken channels.
+
+    **No PC2 file is deleted, and that is the difference from
+    ``cleanup_mesh_cache``.** An orphan is normally a copy of a simulated
+    object, so its modifier points at the ORIGINAL's cache: deleting that
+    file would take the original's animation with it. An orphan that
+    happens to own an unreferenced PC2 leaves it behind on disk instead,
+    which costs a file and destroys nothing.
+    """
+    if obj is None or obj.modifiers.get(MODIFIER_NAME) is None:
+        return False
+    remove_cache_visibility_keys(obj)
+    remove_mesh_cache_modifier(obj)
+    return True
+
+
+def scene_has_solver_cache(scene=None) -> bool:
+    """Stateless: True when a solver-managed object carries animation.
+
+    Solver-managed means the set Clear Local Animation actually clears:
+    objects assigned to an ACTIVE object group. The scope is the whole
+    point. A ``ContactSolverCache`` MESH_CACHE modifier can outlive its
+    group membership, because duplicating a simulated object copies the
+    modifier onto a copy whose inherited UUID the depsgraph handler then
+    strips, leaving the copy in no group at all. Counting that copy would
+    report animation that Clear Local Animation cannot reach, and since
+    ``SOLVER_OT_Run.poll`` is disabled while this returns True, Run would
+    stay greyed out with nothing the user can press to re-enable it.
+    Objects in inactive groups are skipped for the same reason: a parallel
+    setup the user is not simulating right now must not block this one.
+
+    Curves keep their cache in the in-memory ``_curve_cache`` instead of a
+    modifier, keyed by the same UUID, so both paths take the same scope.
+
+    Panel ``poll()`` methods call this on every UI redraw, so the modifier
+    scan stays a C-level collection lookup per object and the assigned-UUID
+    set is built lazily, only once a candidate modifier is actually found.
+    It recomputes every call, so it never goes stale the way a memoized
+    result can.
+    """
+    if scene is None:
+        scene = bpy.context.scene
+    uids = None
+    for obj in bpy.data.objects:
+        if obj.modifiers.get(MODIFIER_NAME) is None:
+            continue
+        if uids is None:
+            uids = assigned_uuids_in_active_groups(scene)
+            if not uids:
+                return False
+        if object_pc2_key_readonly(obj) in uids:
             return True
-    return bool(_curve_cache)
+    if not _curve_cache:
+        return False
+    if uids is None:
+        uids = assigned_uuids_in_active_groups(scene)
+    return any(key in uids for key in _curve_cache)
 
 
 def scene_has_static_deform_cache() -> bool:

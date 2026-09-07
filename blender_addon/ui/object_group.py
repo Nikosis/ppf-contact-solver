@@ -19,7 +19,25 @@ from bpy.app.translations import pgettext_iface as iface_, pgettext_tip as tip_ 
 
 from ..models.enum_props import EnumProperty, dynamic_enum_items
 from ..models.groups import OBJECT_GROUP_DEFAULTS, get_object_type, get_vertex_group_items
-from .state_types import AssignedObject, PinVertexGroupItem
+from ..models.material_locks import LOCKABLE_MATERIAL_PROPS, lock_name
+from .state_types import AssignedObject, MaterialMapItem, PinVertexGroupItem
+
+
+# Blender makes every property keyframable unless `options` says otherwise, and
+# whatever is passed REPLACES the default `{'ANIMATABLE'}` rather than adding to
+# it, so an empty set is how a property refuses an F-curve.
+#
+# Carry this on any property the solver reads exactly once. The encoder samples
+# a group's material sliders across the frame range and ships a schedule; every
+# other value is read at the frame the transfer happens and never revisited.
+# Leaving the default on one of those puts a working keyframe button in front of
+# the artist, records their curve in the .blend, and then ignores it for the
+# whole solve, which is indistinguishable from the feature being broken.
+#
+# The properties WITHOUT this are the animatable set, and they are the same list
+# the encoder samples. Adding a material parameter to one and not the other is
+# what makes a keyframe silently do nothing, so change them together.
+NOT_ANIMATABLE: set = set()
 
 
 def _build_assigned_object_enum_items(group) -> list:
@@ -165,18 +183,20 @@ def _on_pin_profile_selected(self, context):
 
 
 class ObjectGroup(PropertyGroup):
-    name: StringProperty(default="", description="Group name")  # pyright: ignore
+    name: StringProperty(default="", description="Group name", options=NOT_ANIMATABLE)  # pyright: ignore
     material_profile_path: StringProperty(
         name="Material Profile",
         subtype="FILE_PATH",
         default="",
         description="Path to a TOML material parameter profile file",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     material_profile_selection: EnumProperty(
         name="Material Profile",
         items=_get_material_profile_items,
         update=_on_material_profile_selected,
         description="Select a material parameter profile",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     material_preset_selection: EnumProperty(
         name="Material Preset",
@@ -191,19 +211,26 @@ class ObjectGroup(PropertyGroup):
         subtype="FILE_PATH",
         default="",
         description="Path to a TOML pin configuration profile file",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     pin_profile_selection: EnumProperty(
         name="Pin Profile",
         items=_get_pin_profile_items,
         update=_on_pin_profile_selected,
         description="Select a pin configuration profile",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
-    assigned_objects: CollectionProperty(type=AssignedObject)  # pyright: ignore
-    assigned_objects_index: IntProperty(default=-1)  # pyright: ignore  # Selected item in assigned objects list
-    index: IntProperty(default=-1)  # pyright: ignore  # Display index for UI
-    uuid: StringProperty(default="")  # pyright: ignore  # Unique identifier
-    pin_vertex_groups: CollectionProperty(type=PinVertexGroupItem)  # pyright: ignore
-    pin_vertex_groups_index: IntProperty(default=-1)  # pyright: ignore
+    assigned_objects: CollectionProperty(type=AssignedObject, options=NOT_ANIMATABLE)  # pyright: ignore
+    assigned_objects_index: IntProperty(default=-1, options=NOT_ANIMATABLE)  # pyright: ignore  # Selected item in assigned objects list
+    index: IntProperty(default=-1, options=NOT_ANIMATABLE)  # pyright: ignore  # Display index for UI
+    uuid: StringProperty(default="", options=NOT_ANIMATABLE)  # pyright: ignore  # Unique identifier
+    pin_vertex_groups: CollectionProperty(type=PinVertexGroupItem, options=NOT_ANIMATABLE)  # pyright: ignore
+    # Spatial material maps: each varies one parameter across the surface from
+    # this group's own slider toward a target, weighted per vertex. Empty for a
+    # group whose materials are uniform, which is every group by default.
+    material_maps: CollectionProperty(type=MaterialMapItem, options=NOT_ANIMATABLE)  # pyright: ignore
+    material_maps_index: IntProperty(default=-1, options={"HIDDEN"})  # pyright: ignore
+    pin_vertex_groups_index: IntProperty(default=-1, options=NOT_ANIMATABLE)  # pyright: ignore
 
     @dynamic_enum_items
     def _get_velocity_object_items(self, context):
@@ -220,12 +247,14 @@ class ObjectGroup(PropertyGroup):
         default=False,
         description="Show velocity directions in viewport for all objects in this group",
         update=_invalidate_overlay_from_group,
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
 
     use_collision_windows: BoolProperty(
         name="Collision Active Duration Windows",
         default=False,
         description="Restrict collision detection to specific time windows per object",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     @dynamic_enum_items
     def _get_collision_window_object_items(self, context):
@@ -273,9 +302,24 @@ class ObjectGroup(PropertyGroup):
         # Set color based on default object type
         self.color = get_object_type(OBJECT_GROUP_DEFAULTS["object_type"])
 
-        # Clear collections
+        # Clear collections, identity and guard flags. A group SLOT is recycled
+        # by `create_group`, so anything left behind reappears on the next group
+        # made in that slot: a collection naming vertex groups that belong to
+        # some other object, a uuid that makes a retired handle resolve to an
+        # unrelated live group, or a padlock that silently drops its parameter
+        # from the next preset applied.
         self.assigned_objects.clear()
         self.pin_vertex_groups.clear()
+        self.material_maps.clear()
+        self.material_maps_index = 0
+        self.uuid = ""
+        from ..models.material_locks import LOCKABLE_MATERIAL_PROPS, lock_name
+        for locked_prop in LOCKABLE_MATERIAL_PROPS:
+            try:
+                setattr(self, lock_name(locked_prop), False)
+            except AttributeError:
+                # A lock whose property this type does not carry.
+                continue
 
     def update_object_type(self, _):
         self.color = get_object_type(self.object_type)
@@ -314,6 +358,7 @@ class ObjectGroup(PropertyGroup):
         ],
         default=OBJECT_GROUP_DEFAULTS["object_type"],
         update=update_object_type,
+        options=NOT_ANIMATABLE,
     )
     color: FloatVectorProperty(  # pyright: ignore
         name="Color",
@@ -324,6 +369,7 @@ class ObjectGroup(PropertyGroup):
         default=get_object_type("SOLID"),
         description="Color for the group",
         update=update_overlay_color,
+        options=NOT_ANIMATABLE,
     )
     solid_model: EnumProperty(  # pyright: ignore
         name="Model",
@@ -332,6 +378,7 @@ class ObjectGroup(PropertyGroup):
             ("ARAP", "ARAP", "As-Rigid-As-Possible model"),
         ],
         default=OBJECT_GROUP_DEFAULTS["solid_model"],
+        options=NOT_ANIMATABLE,
     )
     shell_model: EnumProperty(  # pyright: ignore
         name="Model",
@@ -348,6 +395,7 @@ class ObjectGroup(PropertyGroup):
             ("BARAFF_WITKIN", "Baraff-Witkin", "Baraff-Witkin model", "NONE", 2),
         ],
         default=OBJECT_GROUP_DEFAULTS["shell_model"],
+        options=NOT_ANIMATABLE,
     )
     rod_model: EnumProperty(  # pyright: ignore
         name="Model",
@@ -355,6 +403,7 @@ class ObjectGroup(PropertyGroup):
             ("ARAP", "ARAP", "As-Rigid-As-Possible model"),
         ],
         default=OBJECT_GROUP_DEFAULTS["rod_model"],
+        options=NOT_ANIMATABLE,
     )
     rod_density: FloatProperty(
         name="Density (kg/m)",
@@ -363,6 +412,7 @@ class ObjectGroup(PropertyGroup):
         max=10000,
         precision=2,
         description="Linear density of the rod material",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     shell_density: FloatProperty(
         name="Density (kg/m\u00b2)",
@@ -371,6 +421,7 @@ class ObjectGroup(PropertyGroup):
         max=10000,
         precision=2,
         description="Area density of the shell material",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     solid_density: FloatProperty(
         name="Density (kg/m\u00b3)",
@@ -379,6 +430,7 @@ class ObjectGroup(PropertyGroup):
         max=10000,
         precision=2,
         description="Volume density of the solid material",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     pdrd_density: FloatProperty(
         name="Density (kg/m³)",
@@ -387,6 +439,7 @@ class ObjectGroup(PropertyGroup):
         max=10000,
         precision=2,
         description="Volume density of the PDRD body; mass is the density times the enclosed volume of the surface mesh",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     sand_grain_radius: FloatProperty(
         name="Grain Radius (m)",
@@ -394,6 +447,7 @@ class ObjectGroup(PropertyGroup):
         min=1e-4,
         precision=4,
         description="Per-grain radius of the granular (sand) particles",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     sand_particle_mass: FloatProperty(
         name="Particle Mass (g)",
@@ -402,6 +456,7 @@ class ObjectGroup(PropertyGroup):
         max=1e6,
         precision=4,
         description="Mass of a single sand particle, in grams (sent to the solver in kilograms)",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     sand_friction: FloatProperty(
         name="Friction",
@@ -409,12 +464,14 @@ class ObjectGroup(PropertyGroup):
         min=0.0,
         precision=2,
         description="Inter-grain friction coefficient of the granular (sand) body",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     enable_soft_constraint: BoolProperty(
         name="Apply Soft Constraints",
         default=OBJECT_GROUP_DEFAULTS["enable_soft_constraint"],
         description="Hold this collider with springs instead of pinning it "
         "exactly, so contact can push it off its animated path",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     # Strictly positive: a pull weight of zero is what classifies a pin as a
     # hard fix, so a zero here would silently reinstate the exact constraint
@@ -430,6 +487,7 @@ class ObjectGroup(PropertyGroup):
         description="Spring stiffness holding each collider vertex to its "
         "animated position. Lower yields more to contact; raise it toward an "
         "exact pin",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
 
     @dynamic_enum_items
@@ -447,6 +505,7 @@ class ObjectGroup(PropertyGroup):
         default=OBJECT_GROUP_DEFAULTS["pdrd_hinge_visualize"],
         description="Draw the hinge axle gizmo in the viewport for hinged bodies in this group",
         update=_invalidate_overlay_from_group,
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
 
     @dynamic_enum_items
@@ -467,6 +526,7 @@ class ObjectGroup(PropertyGroup):
             "for enabled objects in this group"
         ),
         update=_invalidate_overlay_from_group,
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
 
     @dynamic_enum_items
@@ -519,6 +579,7 @@ class ObjectGroup(PropertyGroup):
             "this group's density before sending it to the solver, so a denser "
             "body of the same material is correspondingly stiffer to move"
         ),
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     shell_poisson_ratio: FloatProperty(
         name="Poisson's Ratio",
@@ -556,6 +617,7 @@ class ObjectGroup(PropertyGroup):
         name="Use Group Bounding Box Diagonal",
         default=OBJECT_GROUP_DEFAULTS["use_group_bounding_box_diagonal"],
         description="Use group bounding box diagonal to calculate contact gap",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     contact_gap_rat: FloatProperty(
         name="Contact Gap Ratio",
@@ -597,6 +659,7 @@ class ObjectGroup(PropertyGroup):
         name="Enable Strain Limit",
         default=OBJECT_GROUP_DEFAULTS["enable_strain_limit"],
         description="Enable strain limit for the shell material",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     # Stored and displayed as a percentage (1% allows 1% stretch). The encoder
     # converts to the wire fraction (value / 100) at the solver boundary. Named
@@ -616,6 +679,7 @@ class ObjectGroup(PropertyGroup):
         name="Inflate",
         default=OBJECT_GROUP_DEFAULTS["enable_inflate"],
         description="Enable inflation pressure for the shell surface",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     inflate_pressure: FloatProperty(
         name="Pressure (Pa)",
@@ -629,6 +693,7 @@ class ObjectGroup(PropertyGroup):
         name="Plasticity",
         default=OBJECT_GROUP_DEFAULTS["enable_plasticity"],
         description="Enable plasticity (permanent deformation)",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     plasticity: FloatProperty(
         name="Theta",
@@ -650,6 +715,7 @@ class ObjectGroup(PropertyGroup):
         name="Bend Plasticity",
         default=OBJECT_GROUP_DEFAULTS["enable_bend_plasticity"],
         description="Enable bending plasticity (hinge / rod-joint rest angle drifts)",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     bend_plasticity: FloatProperty(
         name="Bend Theta",
@@ -679,6 +745,7 @@ class ObjectGroup(PropertyGroup):
         ],
         default=OBJECT_GROUP_DEFAULTS.get("bend_rest_angle_source", "FLAT"),
         description="How the initial bending rest angle is populated",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     bend_rest_from_reference: BoolProperty(
         name="From Reference Geometry",
@@ -691,6 +758,7 @@ class ObjectGroup(PropertyGroup):
             "instead of its own initial pose, overriding the group Rest Angle "
             "source for that object"
         ),
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     bend: FloatProperty(
         name="Bend Stiffness",
@@ -721,6 +789,32 @@ class ObjectGroup(PropertyGroup):
             "Stiffness-proportional Rayleigh damping for shell and rod bending "
             "(seconds), usually smaller than deformation damping; 0 disables it"
         ),
+    )  # pyright: ignore
+    allow_self_intersection: BoolProperty(
+        name="Allow Self-Intersections",
+        default=OBJECT_GROUP_DEFAULTS["allow_self_intersection"],
+        description=(
+            "Accept an object that overlaps itself instead of stopping the "
+            "simulation, for a mesh that arrives tangled in its pose. It "
+            "covers each object assigned to this group on its own, so an "
+            "overlap between two of them is an inter-object one. Contact "
+            "still acts on the overlap: the error is suppressed, not the "
+            "collision"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    allow_inter_object_intersection: BoolProperty(
+        name="Allow Inter-Object Intersections",
+        default=OBJECT_GROUP_DEFAULTS["allow_inter_object_intersection"],
+        description=(
+            "Accept an overlap between two different objects instead of "
+            "stopping the simulation, including two objects assigned to this "
+            "same group. Only one of the two sides has to enable it, so "
+            "setting it on a garment also covers the body it is fitted to. "
+            "Contact still acts on the overlap: the error is suppressed, not "
+            "the collision"
+        ),
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     bend_warp: FloatProperty(
         name="Bending Stiffness (Warp)",
@@ -763,6 +857,7 @@ class ObjectGroup(PropertyGroup):
         soft_max=2.0,
         precision=2,
         description="Scale factor along the UV X direction; <1 shrinks, >1 extends",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     shrink_y: FloatProperty(
         name="Shrink Y",
@@ -771,6 +866,7 @@ class ObjectGroup(PropertyGroup):
         soft_max=2.0,
         precision=2,
         description="Scale factor along the UV Y direction; <1 shrinks, >1 extends",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     shrink: FloatProperty(
         name="Shrink",
@@ -779,6 +875,7 @@ class ObjectGroup(PropertyGroup):
         soft_max=2.0,
         precision=2,
         description="Uniform scale factor for solid material; <1 shrinks, >1 extends",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     length_factor: FloatProperty(
         name="Shrink",
@@ -791,6 +888,7 @@ class ObjectGroup(PropertyGroup):
             ">1 extends it. Maps to the solver's 'length-factor' "
             "rod parameter"
         ),
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
 
     # The tetrahedralizer backend picker and its overrides moved to a
@@ -805,37 +903,44 @@ class ObjectGroup(PropertyGroup):
         soft_max=10000.0,
         precision=2,
         description="Stiffness factor for stitch constraints",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     show_parameters: BoolProperty(
         name="Material Params",
         default=OBJECT_GROUP_DEFAULTS["show_parameters"],
         description="Toggle visibility of group parameters",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     active: BoolProperty(
         name="Active",
         default=OBJECT_GROUP_DEFAULTS["active"],
         description="Indicates if the group is active",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     show_overlay_color: BoolProperty(  # pyright: ignore
         name="Overlay Color",
         default=OBJECT_GROUP_DEFAULTS["show_overlay_color"],
         description="Toggle visibility of overlay color",
         update=update_overlay_color,
+        options=NOT_ANIMATABLE,
     )
     show_stats: BoolProperty(
         name="Stats",
         default=OBJECT_GROUP_DEFAULTS["show_stats"],
         description="Toggle visibility of object information",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     show_pin: BoolProperty(
         name="Pins",
         default=OBJECT_GROUP_DEFAULTS["show_pin"],
         description="Toggle visibility of pinned vertex group",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     show_pdrd_hinge: BoolProperty(
         name="Hinge",
         default=OBJECT_GROUP_DEFAULTS["show_pdrd_hinge"],
         description="Expand the per-object PDRD hinge controls",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     pin_overlay_size: FloatProperty(
         name="Pin Size",
@@ -844,14 +949,35 @@ class ObjectGroup(PropertyGroup):
         max=32.0,
         description="Size of pin overlay circles",
         update=_invalidate_overlay,
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     show_group: BoolProperty(
         name="Show Group",
         default=OBJECT_GROUP_DEFAULTS["show_group"],
         description="Toggle visibility of group contents",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
     pin_vertex_group_items: EnumProperty(
         name="Vertex Groups",
         items=get_vertex_group_items,
         description="Select a vertex group to pin",
+        options=NOT_ANIMATABLE,
     )  # pyright: ignore
+
+# One lock per animatable material property, generated rather than written out
+# 32 times. Blender reads these off the class annotations at registration, so
+# they must be added before register() runs, which is what module scope gives.
+#
+# The lock guards against a TOOL overwriting the value (presets, copy-paste
+# material), following Blender's own lock_location. It does not mute an
+# F-curve: a locked Transform channel still animates, and so does this one.
+for _lockable in LOCKABLE_MATERIAL_PROPS:
+    ObjectGroup.__annotations__[lock_name(_lockable)] = BoolProperty(
+        name="Lock",
+        default=False,
+        description=(
+            "Protect this value from material presets and from pasting "
+            "material parameters. Keyframes still apply"
+        ),
+        options=NOT_ANIMATABLE,
+    )

@@ -536,6 +536,8 @@ def _build_obj_data(context, *, persist_topology_hash: bool) -> list:
     from ..uuid_registry import resolve_assigned
     from ..utils import (
         count_duplicate_faces,
+        DegenerateTessellationError,
+        find_degenerate_tessellation,
         find_linked_duplicate_siblings,
     )
     seen = {}
@@ -582,6 +584,11 @@ def _build_obj_data(context, *, persist_topology_hash: bool) -> list:
                         f"Mesh > Merge > By Distance (or delete the "
                         f"duplicate faces) before transferring."
                     )
+                # Triangles the tessellation ships whose rest shape does not
+                # survive fp32. This gate runs in `_refuse_degenerate_tessellation`
+                # instead, inside the starting-frame block, because it has to
+                # judge the pose and the world matrix the encoder ships rather
+                # than whatever the artist's playhead happens to show.
                 if obj.type == "MESH" and group.object_type in {"SHELL", "SOLID"}:
                     pinned = _group_pinned_vertex_indices(group, obj)
                     hanging = detect_hanging_stitch_vertices(obj.data, pinned)
@@ -634,17 +641,152 @@ def _build_obj_data(context, *, persist_topology_hash: bool) -> list:
                             f"> Loose, before transferring."
                         )
 
-    # Compute and (optionally) store mesh topology summary.
-    mesh_hash = compute_mesh_hash(context)
+    # The topology summary is COMPUTED here and stamped by the caller, once
+    # the upload is actually accepted. Stamping here would record a topology as
+    # transferred even when the Transfer went on to fail in the parameter
+    # stage, and the stale-topology warning would then never fire.
     if persist_topology_hash:
-        state.set_mesh_hash(mesh_hash)
+        state.set_pending_mesh_hash(compute_mesh_hash(context))
 
     data = []
     with evaluate_at_start_frame(context, state):
         return _encode_obj_inner(context, scene, state, data)
 
 
+def _refuse_degenerate_tessellation(context, scene, state):
+    """Refuse a scene whose tessellation leaves the solver no usable rest shape.
+
+    Runs inside the starting-frame evaluation block, which is what makes it
+    judge the geometry the encoder ships: the starting frame's deform-evaluated
+    pose through the starting frame's world matrix. Reading the base cage
+    through the playhead's matrix instead lets a shape key, an armature or a
+    keyed scale move a corner onto the line between its neighbors after this
+    has already passed it, and the solver then refuses the build with an index
+    into its own concatenated mesh.
+    """
+    from ..utils import (
+        DegenerateTessellationError,
+        find_degenerate_tessellation,
+    )
+    from ..uuid_registry import resolve_assigned
+
+    for group in iterate_object_groups(scene):
+        if not group.active:
+            continue
+        for assigned in group.assigned_objects:
+            if not assigned.included:
+                continue
+            obj = resolve_assigned(assigned)
+            if obj is None or obj.type != "MESH":
+                continue
+            # A near-collinear rest triangle carries an inverse the elastic
+            # Hessian squares into a NaN. The solver refuses it too, either at
+            # scene build ("degenerate face N: area is zero") or in
+            # `invert_rest_or_panic2`, but both name an index into its own
+            # concatenated mesh, which the artist cannot map back to an object.
+            # Refuse here instead, where the object and the repair are known.
+            # SAND is exempt: a grain cloud has no faces to tessellate.
+            # Which test applies depends on whether these triangles become
+            # ELASTIC elements. A SHELL's always do. A SOLID's do only under
+            # TetGen, which preserves the input boundary; fTetWild remeshes it
+            # and the surface goes to `make_collision_mesh`, whose only
+            # per-triangle check is that the area is positive. A stationary
+            # STATIC collider takes that same path. Refusing those on
+            # conditioning would reject geometry the solver accepts.
+            #
+            # The tradeoff, stated rather than hidden: a STATIC group PROMOTED
+            # into the solved namespace (static ops, a captured deformation, an
+            # unpin time, soft constraints, a stitch endpoint) does reach
+            # `invert_rest_or_panic2`. The addon deliberately does not
+            # duplicate the decoder's promotion rule, so such a group loses
+            # this object-named early refusal and falls back to the solver's
+            # own named panic.
+            if group.object_type == "SAND":
+                degenerate = {"count": 0}
+            else:
+                elastic = group.object_type == "SHELL" or (
+                    group.object_type == "SOLID"
+                    and getattr(assigned, "tet_backend", "FTETWILD") == "TETGEN"
+                )
+                degenerate = find_degenerate_tessellation(
+                    obj,
+                    local_verts=_start_frame_eval_local_verts(
+                        obj, context, state
+                    ),
+                    conditioning=elastic,
+                )
+            if degenerate["count"] > 0:
+                polygons = degenerate["polygons"]
+                preview = ", ".join(str(p) for p in polygons[:8])
+                if len(polygons) > 8:
+                    preview += ", ..."
+                # One remedy sentence per SUBSET, each naming its own faces.
+                # A mutually exclusive chain misdescribes a mixed set: an
+                # offender list holding both a repairable quad and a flagged
+                # triangle would name only one of them and leave the artist
+                # repairing half the scene.
+                def _preview(indices):
+                    text = ", ".join(str(p) for p in indices[:8])
+                    return text + (", ..." if len(indices) > 8 else "")
+
+                repairable = degenerate["repairable_polygons"]
+                triangles = degenerate["triangle_polygons"]
+                others = [
+                    p for p in polygons
+                    if p not in set(repairable) and p not in set(triangles)
+                ]
+                parts = []
+                if repairable:
+                    parts.append(
+                        f"Face index {_preview(repairable)} is sound itself; "
+                        "only the way Blender splits it into triangles is "
+                        "degenerate, which happens when a face carries a "
+                        "vertex sitting on, or very near, the straight edge "
+                        "between two of its neighbors. Select the mesh in "
+                        "Edit Mode and run Face > Triangulate Faces (Ctrl+T), "
+                        "which picks the diagonals itself."
+                    )
+                if triangles:
+                    parts.append(
+                        f"Face index {_preview(triangles)} is already a "
+                        "triangle, so it is its own only triangulation and no "
+                        "re-split can help: one of its corners sits on, or "
+                        "very near, the line between the other two. Move that "
+                        "vertex off the line, or dissolve the triangle into "
+                        "its neighbor."
+                    )
+                if others:
+                    parts.append(
+                        f"Face index {_preview(others)} has no sound "
+                        "triangulation at all: a polygon of no area has none, "
+                        "and neither does one with a zero-length boundary "
+                        "edge, since every boundary edge belongs to a triangle "
+                        "of every triangulation. Run Mesh > Merge > By "
+                        "Distance to weld coincident vertices, or dissolve "
+                        "those faces."
+                    )
+                remedy = " ".join(parts) + " Then transfer again."
+                raise DegenerateTessellationError(
+                    f"Object '{obj.name}' in group '{group.name}' "
+                    f"tessellates into {degenerate['count']} triangle(s) "
+                    f"with no usable rest shape, from face index {preview}. "
+                    f"A triangle whose three vertices are collinear, "
+                    f"coincident, or close enough to collinear that its "
+                    f"inverse rest shape is rounding noise carries an "
+                    f"elastic Hessian the solver cannot represent, and the "
+                    f"run fails on it. {remedy}",
+                    object_name=obj.name,
+                    group_name=group.name,
+                    polygons=polygons,
+                    repairable=degenerate["all_repairable_by_triangulation"],
+                )
+
+
 def _encode_obj_inner(context, scene, state, data):
+    # The starting-frame block is already open here, which is the whole reason
+    # this gate runs at this point rather than with the other validators.
+    _refuse_degenerate_tessellation(context, scene, state)
+
     # The DATA payload is deliberately timing-free: every animation channel
     # below ships FRAME OFFSETS relative to the resolved start frame, and
     # the decoder derives seconds from the PARAM payload's fps. That keeps

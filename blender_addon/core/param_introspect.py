@@ -21,6 +21,10 @@ _SCALAR_RNA_TYPES = frozenset({"BOOLEAN", "INT", "FLOAT", "STRING", "ENUM"})
 # per-group context, computed caches, and per-assigned-object
 # collections. Anything not in this set is treated as a material
 # parameter and flows through copy/paste automatically.
+from ..models.material_locks import (
+    LOCKABLE_MATERIAL_PROPS as _LOCKABLE_MATERIAL_PROPS,
+)
+
 MATERIAL_CLIPBOARD_EXCLUDE = frozenset({
     "name",
     "uuid",
@@ -54,6 +58,11 @@ MATERIAL_CLIPBOARD_EXCLUDE = frozenset({
     "show_pdrd_hinge",
     "show_group",
     "pin_vertex_group_items",
+    # Per-parameter locks. A lock is the DESTINATION artist's protection, not
+    # part of a material, so neither a paste nor a preset may carry one. If it
+    # did, pasting from an unlocked group would clear every protection on the
+    # target, which is the opposite of what the padlock promises.
+    *(f"lock_{_p}" for _p in _LOCKABLE_MATERIAL_PROPS),
 })
 
 # PinOperation ``show_*`` flags are viewport-only preview toggles; the

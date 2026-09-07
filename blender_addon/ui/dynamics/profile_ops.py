@@ -10,6 +10,7 @@ from bpy.app.translations import pgettext_iface as iface_  # pyright: ignore
 from bpy.props import BoolProperty, IntProperty, PointerProperty, StringProperty  # pyright: ignore
 from bpy.types import Operator  # pyright: ignore
 
+from ...models.material_locks import locked_props
 from ...core.param_introspect import (
     MATERIAL_CLIPBOARD_EXCLUDE,
     PIN_OP_CLIPBOARD_EXCLUDE,
@@ -282,14 +283,30 @@ class OBJECT_OT_PasteMaterialParams(Operator):
         # cross-type pastes don't overwrite the target's unused
         # shell_*/solid_*/rod_* fields with the source's defaults.
         src_type = wm.material_clipboard_src_type or group.object_type
+        # A locked parameter is skipped, which is what the padlock beside it
+        # promises: the lock guards the value from the tools that overwrite a
+        # whole group at once, exactly as Transform > Location's lock guards
+        # against transform tools. It does not mute an F-curve.
+        locked = locked_props(group)
         copy_scalar_props(
             wm.material_clipboard,
             group,
             exclude=MATERIAL_CLIPBOARD_EXCLUDE,
-            filter_fn=lambda n: material_param_applies(n, src_type),
+            filter_fn=lambda n: material_param_applies(n, src_type)
+            and n not in locked,
         )
         redraw_all_areas(context)
-        self.report({"INFO"}, iface_("Material params pasted"))
+        if locked:
+            # Say what was NOT pasted. A silent skip looks identical to a
+            # paste that did nothing, and the artist cannot see which values
+            # the clipboard held.
+            self.report(
+                {"INFO"},
+                iface_("Material params pasted; %d locked value(s) kept")
+                % len(locked),
+            )
+        else:
+            self.report({"INFO"}, iface_("Material params pasted"))
         return {"FINISHED"}
 
 

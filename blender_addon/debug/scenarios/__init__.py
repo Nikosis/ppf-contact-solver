@@ -22,6 +22,17 @@ REPO_ROOT_POSIX: str = os.path.abspath(
 """Repo root with forward-slash separators. Driver string-substitution
 on Windows would otherwise emit backslash escapes."""
 
+from . import rig_emulated_intersection
+from . import rig_lock_axes
+from . import rig_emulated_lock_axes
+from . import rig_intersection_allowances
+from . import rig_intersection_allowance_isolation
+from . import bl_server_stop_is_real
+from . import rig_collider_coincident_pair
+from . import rig_degenerate_rest_shape
+from . import bl_fetch_frame_discovery
+from . import rig_degenerate_tet_rest_shape
+from . import rig_coincident_contact_pair
 from . import rig_launch_config
 from . import rig_session_artifact_identity
 from . import server_smoke
@@ -29,8 +40,13 @@ from . import upload_id_changes
 from . import bl_connect_local
 from . import bl_connect_win_native
 from . import bl_connection_path_validation
+from . import bl_connection_path_relative
+from . import bl_connection_failure_reporting
+from . import bl_cbor2_missing_reported
+from . import bl_docker_connect_gate
 from . import bl_ssh_proxy_jump
 from . import bl_win_native_root_resolve
+from . import bl_win_native_bundle_layout
 from . import bl_solver_gpu_select
 from . import bl_direct_disk_transfer
 from . import bl_rust_binary_protocol
@@ -64,6 +80,8 @@ from . import bl_recapture_all_deformations
 from . import bl_geonode_deform_input
 from . import bl_geonode_capture_range_frame_count
 from . import bl_static_smooth_by_angle_no_capture
+from . import bl_autosave_modal_residency
+from . import bl_cache_placement_heal
 from . import bl_static_keyframe_capture_hint
 from . import bl_bake_aborts_unfetched
 from . import bl_pin_make_keyframe_writes_fcurves
@@ -117,6 +135,8 @@ from . import bl_ngon_triangulation
 from . import bl_duplicate_face_rejection
 from . import bl_hanging_stitch_vertex_rejection
 from . import bl_isolated_vertex_rejection
+from . import bl_degenerate_tessellation_rejection
+from . import bl_degenerate_tessellation_repair
 from . import bl_mesh_cleaning
 from . import bl_upload_id_desync_recovery
 from . import bl_mesh_cache_self_heal
@@ -198,6 +218,7 @@ from . import bl_ftetwild_overrides
 from . import bl_project_rename_resync
 from . import bl_intersection_records_roundtrip
 from . import bl_violation_overlay_classification
+from . import bl_intersection_allowances
 from . import bl_self_intersection_build_reject
 from . import bl_solid_zero_volume_reject
 from . import bl_solid_fix_weight_threshold
@@ -217,6 +238,15 @@ from . import bl_pin_reorder_and_gating
 from . import bl_copy_paste_material_params
 from . import bl_copy_paste_pin_ops
 from . import bl_copy_paste_cross_type_material
+from . import bl_material_keyframe_animates
+from . import bl_material_lock_guards
+from . import bl_material_map_animates
+from . import bl_material_map_every_key
+from . import bl_material_map_refusals
+from . import bl_material_map_panel_draws
+from . import bl_material_map_sample_ops
+from . import bl_solid_spatial_material_map
+from . import bl_spatial_material_map
 from . import bl_material_preset_apply
 
 # Operator-poll regression: the Transfer button used to remain
@@ -251,6 +281,31 @@ REGISTRY = {
     "server_smoke": server_smoke,
     "upload_id_changes": upload_id_changes,
 
+    # Every Lock Translation / Lock Rotation mode at its two gates: the bytes
+    # that reach the session directory, and the projector that reads them. The
+    # `bl_lock_*` and `bl_emulated_lock_*` scenarios cover the addon encoder
+    # and the same physics driven through Blender; neither of these needs it.
+    "rig_lock_axes": rig_lock_axes,
+    "rig_emulated_lock_axes": rig_emulated_lock_axes,
+
+    # The issue-#138 intersection allowances, at their three gates: the
+    # emulator's live scan, the scene-build check, and whether an allowance
+    # stays inside the pairs that asked for it. None needs Blender.
+    "rig_emulated_intersection": rig_emulated_intersection,
+    "rig_intersection_allowances": rig_intersection_allowances,
+    "rig_intersection_allowance_isolation": rig_intersection_allowance_isolation,
+
+    # The solver's build-time rest-shape gate: a near-collinear shell face is
+    # finite and invertible, so only its conditioning gives it away (issue
+    # #144). `bl_degenerate_tessellation_rejection` covers the addon-side gate
+    # that refuses the same geometry a step earlier; both grant the same set.
+    "bl_server_stop_is_real": bl_server_stop_is_real,
+    "rig_collider_coincident_pair": rig_collider_coincident_pair,
+    "rig_degenerate_rest_shape": rig_degenerate_rest_shape,
+    "bl_fetch_frame_discovery": bl_fetch_frame_discovery,
+    "rig_degenerate_tet_rest_shape": rig_degenerate_tet_rest_shape,
+    "rig_coincident_contact_pair": rig_coincident_contact_pair,
+
     # How the rig LAUNCHES Blender (window size, PPF_BLENDER_WINDOW
     # parsing, display probing). Server-only so it does not need the
     # Blender it configures.
@@ -268,8 +323,13 @@ REGISTRY = {
     "bl_connect_local": bl_connect_local,
     "bl_connect_win_native": bl_connect_win_native,
     "bl_connection_path_validation": bl_connection_path_validation,
+    "bl_connection_path_relative": bl_connection_path_relative,
+    "bl_connection_failure_reporting": bl_connection_failure_reporting,
+    "bl_cbor2_missing_reported": bl_cbor2_missing_reported,
+    "bl_docker_connect_gate": bl_docker_connect_gate,
     "bl_ssh_proxy_jump": bl_ssh_proxy_jump,
     "bl_win_native_root_resolve": bl_win_native_root_resolve,
+    "bl_win_native_bundle_layout": bl_win_native_bundle_layout,
     "bl_solver_gpu_select": bl_solver_gpu_select,
     "bl_direct_disk_transfer": bl_direct_disk_transfer,
     "bl_rust_binary_protocol": bl_rust_binary_protocol,
@@ -307,6 +367,8 @@ REGISTRY = {
     "bl_geonode_deform_input": bl_geonode_deform_input,
     "bl_geonode_capture_range_frame_count": bl_geonode_capture_range_frame_count,
     "bl_static_smooth_by_angle_no_capture": bl_static_smooth_by_angle_no_capture,
+    "bl_autosave_modal_residency": bl_autosave_modal_residency,
+    "bl_cache_placement_heal": bl_cache_placement_heal,
     "bl_static_keyframe_capture_hint": bl_static_keyframe_capture_hint,
     "bl_bake_aborts_unfetched": bl_bake_aborts_unfetched,
     "bl_pin_make_keyframe_writes_fcurves": bl_pin_make_keyframe_writes_fcurves,
@@ -358,6 +420,10 @@ REGISTRY = {
     "bl_duplicate_face_rejection": bl_duplicate_face_rejection,
     "bl_hanging_stitch_vertex_rejection": bl_hanging_stitch_vertex_rejection,
     "bl_isolated_vertex_rejection": bl_isolated_vertex_rejection,
+    "bl_degenerate_tessellation_rejection":
+        bl_degenerate_tessellation_rejection,
+    "bl_degenerate_tessellation_repair":
+        bl_degenerate_tessellation_repair,
     "bl_mesh_cleaning": bl_mesh_cleaning,
 
     # Tier 1: bug-fix-driven coverage (commits ea4303cb, 92546e18, a8766a08,
@@ -450,6 +516,17 @@ REGISTRY = {
     # injecting a synthetic ServerPolled.
     "bl_intersection_records_roundtrip": bl_intersection_records_roundtrip,
     "bl_violation_overlay_classification": bl_violation_overlay_classification,
+
+    # The ADDON half of the intersection allowances: that the two group
+    # checkboxes and the per-pin one reach the built session at all. The
+    # rig_intersection_allowances and rig_emulated_intersection scenarios
+    # cover what they mean once they get there, and neither loads Blender.
+    # It sits after the two entries above because it belongs with the
+    # intersection cluster, and below their comment rather than inside it
+    # because it drives an ordinary build and reads the session directory:
+    # it sets neither of those knobs and injects no ServerPolled.
+    "bl_intersection_allowances": bl_intersection_allowances,
+
     "bl_self_intersection_build_reject": bl_self_intersection_build_reject,
     "bl_solid_zero_volume_reject": bl_solid_zero_volume_reject,
     "bl_solid_fix_weight_threshold": bl_solid_fix_weight_threshold,
@@ -466,6 +543,15 @@ REGISTRY = {
     "bl_copy_paste_material_params": bl_copy_paste_material_params,
     "bl_copy_paste_pin_ops": bl_copy_paste_pin_ops,
     "bl_copy_paste_cross_type_material": bl_copy_paste_cross_type_material,
+    "bl_material_keyframe_animates": bl_material_keyframe_animates,
+    "bl_material_lock_guards": bl_material_lock_guards,
+    "bl_material_map_animates": bl_material_map_animates,
+    "bl_material_map_every_key": bl_material_map_every_key,
+    "bl_material_map_refusals": bl_material_map_refusals,
+    "bl_material_map_panel_draws": bl_material_map_panel_draws,
+    "bl_material_map_sample_ops": bl_material_map_sample_ops,
+    "bl_solid_spatial_material_map": bl_solid_spatial_material_map,
+    "bl_spatial_material_map": bl_spatial_material_map,
     "bl_material_preset_apply": bl_material_preset_apply,
 
     # Operator-poll regression for Transfer-during-Run.

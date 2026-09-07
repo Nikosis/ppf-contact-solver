@@ -61,6 +61,42 @@ __device__ inline float report_coincident() {
     return 0.0f;
 }
 
+// Flag a contact pair whose separation has already collapsed to the contact
+// offset when the ASSEMBLY reads it, which is the same physical state the sweep
+// above reports and so takes the same route to the host. The barrier is
+// singular at that separation and the contact normal is a 0/0 normalize, so the
+// pair carries no usable force and the assembly contributes nothing for it.
+//
+// Recording is what makes the outcome identical on both shipped builds, and an
+// assert cannot be. NDEBUG is absent from the cargo CUDA build and present in
+// the Windows one, so an assert on this condition traps the device on the first
+// and is compiled out of the second, leaving that build to normalize a zero
+// vector and assemble a NaN into the system. Neither outcome names a cause;
+// `contact_separated = false` plus a named pair does.
+//
+// Kinds 6-9 mark an assembly-side report and are disjoint from the sweep's 0-5
+// for one reason beyond provenance: the distance and offset recorded here are
+// the assembly's own WORLD-space values, while the sweep records its rescaled
+// ones. One number under two meanings is exactly what the note above this
+// warns against, so the host keys its units wording on the kind. 6 is the
+// shared embed, which funnels every pair type through one place and so cannot
+// name one (the two vertex indices carry the locality instead); 7, 8 and 9 are
+// the collision-mesh vertex-face, face-vertex and edge-edge paths, which do
+// their own barrier math and do know their type.
+__device__ inline void report_contact_overlap(unsigned v0, unsigned v1,
+                                              unsigned kind, float d2,
+                                              float offset) {
+    g_ccd_overlap = 1u;
+    // First reporter wins the pair, exactly as record_overlap_pair does, so the
+    // reported indices stay consistent across threads.
+    if (atomicCAS(&g_ccd_overlap_v0, 0xFFFFFFFFu, v0) == 0xFFFFFFFFu) {
+        g_ccd_overlap_v1 = v1;
+        g_ccd_overlap_kind = kind;
+    }
+    g_ccd_overlap_d2 = d2;
+    g_ccd_overlap_offset = offset;
+}
+
 template <class T, unsigned R, unsigned C>
 __device__ void centerize(SMat<T, R, C> &x) {
     SVec<T, R> mov = SVec<T, R>::Zero();

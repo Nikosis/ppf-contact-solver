@@ -64,7 +64,17 @@ class Disconnected(Event):
 
 @dataclass(frozen=True)
 class ConnectionLost(Event):
-    """Connection dropped unexpectedly (e.g. SSH transport dead)."""
+    """Connection dropped unexpectedly (e.g. SSH transport dead).
+
+    ``cause`` is the text of the exception that ended the operation, when
+    there was one. The panel shows it after the headline, because the
+    headline alone cannot distinguish the cases the user has to tell apart:
+    a container whose server port was never published with ``-p`` reads
+    exactly like a dead SSH transport once the cause is dropped, and only
+    one of the two has an action attached to it.
+    """
+
+    cause: str = ""
 
 
 # ---------------------------------------------------------------------------

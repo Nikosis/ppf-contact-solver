@@ -371,8 +371,14 @@ pub fn check_self_intersection(
             is_collider: coll,
             rod_edges: rod,
             // Standalone utility binding (tests / _intersection_.py); the PDRD
-            // body filter is applied only in the scene-build assemble path.
+            // body filter and the issue-#138 intersection allowances are
+            // applied only in the scene-build assemble path, which is the one
+            // that has to agree with the solver. This binding answers the raw
+            // geometric question.
             tri_body_id: None,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         })
     });
     Ok(pairs)

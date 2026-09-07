@@ -27,6 +27,16 @@ documentation, grouped by subject and alphabetized within each group.
   Blender, letting pinned vertices follow a hand-animated or scripted
   pose sequence during the solve.
 
+**Intersection allowance**
+: An opt-in that accepts already-overlapping geometry instead of refusing
+  to simulate it. Two are set on a group and apply to every object assigned
+  to it (**Allow Self-Intersections**, **Allow Inter-Object
+  Intersections**), and one is set on a pin (**Allow Intersections Here**).
+  "Self" means one object's overlap with itself, so two objects in one group
+  make an inter-object pair. Each suppresses the report only; contact still
+  acts on the overlap. See
+  [Allow Intersections](workflow/params/material.md#allow-intersections).
+
 **Invisible collider**
 : A parametric wall or sphere that acts as a collision boundary for the
   simulation without being rendered in Blender. Walls are infinite planes;

@@ -275,8 +275,88 @@ def _build_velocity_arrow_batches(scene, view_distance):
     return batches, labels
 
 
+# The three world axes an all-axes lock glyph is built from. A per-axis lock
+# draws the one direction the constraint names; an all-axes lock names none,
+# so its glyph covers X, Y and Z equally.
+_LOCK_ALL_AXES = (
+    Vector((1.0, 0.0, 0.0)),
+    Vector((0.0, 1.0, 0.0)),
+    Vector((0.0, 0.0, 1.0)),
+)
+
+
+def _lock_preview_geometry(assigned, depsgraph):
+    """World-space vertices and centroid for one lock-preview object.
+
+    Returns ``(center, vertices)``, or ``(None, None)`` when the object is
+    gone from the scene or evaluates to no vertices, in which case the
+    caller draws nothing for it. The centroid stands in for the center of
+    mass the constraint acts on, as the per-axis arrow and ring branches
+    below do.
+    """
+    from ....core.uuid_registry import resolve_assigned
+
+    obj = resolve_assigned(assigned)
+    if obj is None:
+        return None, None
+    vertices = _evaluated_world_vertices(obj, depsgraph)
+    if not vertices:
+        return None, None
+    center = sum(vertices, Vector((0.0, 0.0, 0.0))) / len(vertices)
+    return center, vertices
+
+
+def _lock_all_translation_tris(center, arrow_len, thickness):
+    """Six arrows converging on *center*: the Lock All Translations glyph.
+
+    A per-axis Lock Translation draws a double-headed arrow pointing OUT
+    along the one line the center of mass may still slide on. An all-axes
+    lock leaves no such line, so the glyph inverts: one arrow per world
+    half-axis, every one of them pointing IN at the pinned point. Arrows
+    converging from every side read as held rather than free, and the shape
+    is neither the outward per-axis pair nor the pin preview's spheres.
+    """
+    shaft_length = arrow_len
+    cone_length = arrow_len * 0.18
+    span = shaft_length + cone_length
+    tris = []
+    for axis in _LOCK_ALL_AXES:
+        for direction in (axis, -axis):
+            shaft, cone = _generate_arrow(
+                -direction,
+                shaft_length=shaft_length,
+                shaft_thickness=thickness * 2,
+                cone_length=cone_length,
+                cone_radius=thickness * 5,
+            )
+            # The arrow is generated at the origin and points inward, so
+            # starting it one full span out lands every cone tip on the
+            # center.
+            start = center + direction * span
+            tris.extend(vertex + start for vertex in shaft + cone)
+    return tris
+
+
+def _lock_all_rotation_tris(center, radius, thickness):
+    """Three orthogonal rings around *center*: the Lock All Rotations glyph.
+
+    A per-axis Lock Rotation draws one ring plus a full-turn arrow arc on
+    the axis the constraint names. An all-axes lock names no axis and
+    leaves no turn to arrow, so the glyph is the three world rings and no
+    arc at all: a cage rather than a dial, distinct from both the single
+    ring and the pin preview's spheres.
+    """
+    tris = []
+    for axis in _LOCK_ALL_AXES:
+        tris.extend(_generate_circle(center, axis, radius, thickness=thickness))
+    return tris
+
+
 def _build_translation_lock_batches(scene, view_distance):
-    """Build double-headed world-space axis arrows for Lock Translation."""
+    """Build the Lock Translation glyphs: a double-headed world-space axis
+    arrow per line-locked object, and the six converging arrows of
+    `_lock_all_translation_tris` for an object whose center of mass is
+    pinned to a point."""
     from ....core.uuid_registry import resolve_assigned
 
     batches = []
@@ -291,6 +371,20 @@ def _build_translation_lock_batches(scene, view_distance):
         color = (*group.color[:3], 0.9)
         for assigned in group.assigned_objects:
             if not assigned.included or not assigned.lock_translation_enable:
+                continue
+            # The MODE carries the enable bit, not the axis: an all-axes
+            # lock ships no axis at all, so testing the axis here would
+            # silently draw nothing for exactly the objects that are most
+            # constrained.
+            if assigned.lock_translation_all:
+                center, _ = _lock_preview_geometry(assigned, depsgraph)
+                if center is None:
+                    continue
+                triangles = _lock_all_translation_tris(center, arrow_len, thickness)
+                if triangles:
+                    batches.append(
+                        (batch_for_shader(shader, "TRIS", {"pos": triangles}), color)
+                    )
                 continue
             axis = Vector(assigned.lock_translation_axis)
             if axis.length < 1e-6:
@@ -320,7 +414,9 @@ def _build_translation_lock_batches(scene, view_distance):
 
 
 def _build_rotation_lock_batches(scene, view_distance):
-    """Build a world-axis rotation ring + arc for Lock Rotation.
+    """Build a world-axis rotation ring + arc for Lock Rotation, or the
+    three rings of `_lock_all_rotation_tris` for an object locked against
+    rotation about every axis.
 
     Mirrors the angular-velocity spin preview and the PDRD hinge gizmo
     (circle + a full-turn directional arc through the object centroid,
@@ -344,6 +440,27 @@ def _build_rotation_lock_batches(scene, view_distance):
         color = (*group.color[:3], 0.9)
         for assigned in group.assigned_objects:
             if not assigned.included or not assigned.lock_rotation_enable:
+                continue
+            # Mode before axis, for the reason given in
+            # `_build_translation_lock_batches` above.
+            if assigned.lock_rotation_all:
+                center, verts_world = _lock_preview_geometry(assigned, depsgraph)
+                if center is None:
+                    continue
+                # No axis to measure the extent perpendicular to, so the
+                # rings take the mean radius of the whole cloud.
+                avg_radius = sum(
+                    (v - center).length for v in verts_world
+                ) / len(verts_world)
+                if avg_radius < 1e-4:
+                    avg_radius = 0.1
+                triangles = _lock_all_rotation_tris(
+                    center, avg_radius, max(0.002, avg_radius * 0.01),
+                )
+                if triangles:
+                    batches.append(
+                        (batch_for_shader(shader, "TRIS", {"pos": triangles}), color)
+                    )
                 continue
             axis = Vector(assigned.lock_rotation_axis)
             if axis.length < 1e-6:

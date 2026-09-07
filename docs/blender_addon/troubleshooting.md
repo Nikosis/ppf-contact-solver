@@ -305,6 +305,32 @@ normal, and only a **Solid** group needs a closed surface. The
 with no diagonal left for Blender to re-pick as the mesh deforms, which
 is what keeps the displayed surface on the simulated one.
 
+### "N self-intersections (... tri-tri, ... rod-tri)"
+
+Two pieces of geometry already overlap, so the scene is refused before the
+first frame is solved: a mesh folding through itself, a mesh through another
+mesh, or a mesh through a collider. The count is of overlapping element
+pairs, split by whether the pair is two triangles or a rod segment against a
+triangle. The solver runs its own intersection test as it steps; an overlap
+found there ends the run, and the log line reads `### intersection
+detected`.
+
+The fix is to separate the geometry: move the collider or the character to a
+pose the garment sits outside of, or edit the mesh so the fold is gone.
+
+When the overlap is expected and the simulation is meant to resolve it, a
+garment fitted onto a rig-deformed character being the usual case, the
+group settings under
+[Allow Intersections](workflow/params/material.md#allow-intersections)
+accept the pairs you name instead of stopping. Set them on the group that is
+simulated: a **Static** collider left in its rest pose carries neither
+setting, so it is the garment's group that has to allow the pair. For an
+overlap confined to a pinned region, the narrower per-pin
+[Allow Intersections Here](workflow/constraints/pins.md#allow-intersections-here)
+does the same for the elements that pin holds completely. Both suppress the
+report only: the surfaces are still in contact and the solver still pushes
+them apart.
+
 ### Run button is disabled
 
 A bake is still running. Let it finish or click **Abort**.

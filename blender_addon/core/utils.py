@@ -3,6 +3,8 @@
 # Review: Ryoichi Ando (ryoichi.ando@zozo.com)
 # License: Apache v2.0
 
+import os
+
 import bpy  # pyright: ignore
 
 from ..models.groups import decode_vertex_group_identifier, iterate_active_object_groups
@@ -14,18 +16,43 @@ def get_category_name():
     return "ZOZO's Contact Solver"
 
 
-# Characters that break a connection path when it is interpolated into a shell
-# command (``cd {path} && ...``, ``docker exec -w {path} ...``).  Whitespace
-# plus shell and glob metacharacters.  ``~`` is intentionally NOT included:
+# Characters a shell would reinterpret in a connection path that is
+# interpolated into a command (``cd {path} && ...``,
+# ``docker exec -w {path} ...``).  ``~`` is intentionally NOT included:
 # ``~/work`` is a common, safe remote path and the shell expands it fine.  The
 # usual path components (``/``, ``\``, ``:``, ``.``, ``-``, ``_``) are also
 # allowed so Windows drive letters and separators pass.
-_INVALID_PATH_CHARS = frozenset(
-    " \t\n\r"          # whitespace
+_SHELL_UNSAFE_PATH_CHARS = frozenset(
     "&|;<>()$`\"'"     # shell metacharacters
     "*?[]{}#"          # glob, brace expansion, comment
     "!%^"              # history expansion, env, caret
 )
+
+# Whitespace on top of the above. A path that IS interpolated into a remote
+# shell command has to refuse both; one that never reaches a shell is held to
+# ``find_shell_unsafe_path_char`` instead.
+_INVALID_PATH_CHARS = _SHELL_UNSAFE_PATH_CHARS | frozenset(" \t\n\r")
+
+
+def find_shell_unsafe_path_char(path: str) -> str | None:
+    """Return the first shell or glob metacharacter in *path*, else ``None``.
+
+    The same set as :func:`find_invalid_path_char` MINUS whitespace. It is
+    what a path is held to when it never reaches a shell: the Windows Native
+    root is only ever an ``os.path.join`` base, a ``subprocess.Popen`` argv
+    element, and that Popen's ``cwd``, none of which parse it. Whitespace is
+    therefore harmless there, and it is ordinary: ``C:\\Users\\First
+    Last\\Downloads\\...`` is what a Windows account with a two-word name
+    gives, and holding it to the whitespace rule refuses that path.
+
+    The metacharacters stay refused even here. They are illegal in a Windows
+    filename anyway, so nothing legitimate is rejected, and the check keeps
+    holding if this path is ever handed to something that does parse it.
+    """
+    for ch in path.strip():
+        if ch in _SHELL_UNSAFE_PATH_CHARS:
+            return ch
+    return None
 
 
 def find_invalid_path_char(path: str) -> str | None:
@@ -41,6 +68,42 @@ def find_invalid_path_char(path: str) -> str | None:
         if ch in _INVALID_PATH_CHARS:
             return ch
     return None
+
+
+def resolve_local_path(path: str) -> str:
+    """Return *path* as an absolute path on the machine Blender runs on.
+
+    The two connection paths that name a directory on the CLIENT machine
+    (``local_path`` and ``win_native_path``) are ``DIR_PATH`` properties, so
+    Blender's directory picker writes them in whatever form the user's
+    ``Preferences > File Paths > Relative Paths`` setting asks for. That
+    setting ships enabled, so once the .blend has been saved the picker
+    stores a ``//``-prefixed path relative to the .blend
+    (``//../ppf-contact-solver-win64``). ``//`` is Blender's own notation and
+    means nothing to ``os.path``: probing it finds no solver, and the panel
+    reports the folder the user just picked as one that holds no
+    ``ppf-cts-server``. Expanding it here is what makes a picked folder mean
+    the folder that was picked.
+
+    ``bpy.path.abspath`` resolves the ``//`` form against the current .blend
+    and leaves an already-absolute path alone, so this is safe to apply to
+    every value the property can hold, typed or picked. A blank path stays
+    blank: emptiness is validated per connection type, and turning it into
+    the .blend's directory would make an unset field look set.
+
+    Only client-side paths go through this. A REMOTE path (``ssh_remote_path``,
+    ``docker_path``) names a directory on the solver host, where the client's
+    .blend location has no meaning, so those are used verbatim.
+    """
+    if not path or not path.strip():
+        return path
+    # ``normpath`` after ``abspath`` because ``bpy.path.abspath`` only splices
+    # the .blend's directory onto the tail: ``//../bundle`` next to a project
+    # at ``/work/project`` comes back as ``/work/project/../bundle``. That
+    # opens and probes correctly, but it is longer than the path it names, so
+    # the Windows MAX_PATH projection would measure the wrong length, and it
+    # is what the panel and every refusal would quote back at the user.
+    return os.path.normpath(bpy.path.abspath(path.strip()))
 
 
 # Windows refuses to open a path of 260 characters or more (the classic
@@ -209,6 +272,346 @@ def count_duplicate_faces(obj) -> int:
         else:
             seen.add(key)
     return duplicates
+
+
+class DegenerateTessellationError(ValueError):
+    """A Transfer refused because an object tessellates into triangles with no
+    usable rest shape.
+
+    Subclasses ``ValueError`` so every existing ``except ValueError`` around the
+    encoder keeps catching it; the added fields are what lets the UI offer the
+    repair instead of only printing the sentence. ``repairable`` is
+    ``find_degenerate_tessellation``'s ``all_repairable_by_triangulation``, which is the
+    question "would triangulating help?", so a dialog must not offer the
+    Triangulate button when it is False: those faces are degenerate themselves
+    and no triangulation of them avoids the problem.
+    """
+
+    def __init__(self, message, *, object_name, group_name, polygons, repairable):
+        super().__init__(message)
+        self.object_name = object_name
+        self.group_name = group_name
+        self.polygons = list(polygons)
+        self.repairable = bool(repairable)
+
+
+def triangulate_degenerate_faces(obj, found=None) -> tuple[int, int]:
+    """Triangulate exactly the polygons of *obj* whose tessellation has no
+    usable rest shape, leaving every other face of the mesh alone.
+
+    Returns ``(split, unrepairable)``: how many polygons were split, and how
+    many were left because no triangulation of them can help (a flagged polygon
+    that is ALREADY a triangle is its own only triangulation, and one carrying a
+    zero-length boundary edge forces a degenerate triangle into every
+    triangulation).
+
+    Scoped to the offending polygons on purpose. Face > Triangulate Faces over
+    a selection converts every quad in it, which is a far larger change to the
+    artist's mesh than the defect warrants, and the rest of the mesh has nothing
+    wrong with it.
+
+    The caller must be in Object Mode: bmesh reads and writes the mesh
+    datablock, which is stale while the object is in Edit Mode.
+
+    `found` is a :func:`find_degenerate_tessellation` result for `obj`, so a
+    caller that has already scanned does not pay for the pass twice. That scan
+    measures the BASE cage, deliberately: re-splitting a polygon is all this
+    can change, and a deform-evaluated pose is not something a split moves.
+    """
+    import bmesh
+
+    if found is None:
+        found = find_degenerate_tessellation(obj)
+    if not found["polygons"]:
+        return 0, 0
+    if not found["repairable_polygons"]:
+        return 0, len(found["polygons"])
+
+    me = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.faces.ensure_lookup_table()
+    n = len(bm.faces)
+    # The repairable SUBSET, not every flagged polygon. A polygon with no
+    # sound triangulation is left exactly as it is: splitting it would edit
+    # the artist's mesh and still leave a degenerate triangle behind.
+    splittable = [bm.faces[i] for i in found["repairable_polygons"] if 0 <= i < n]
+    unrepairable = len(found["polygons"]) - len(found["repairable_polygons"])
+    if splittable:
+        bmesh.ops.triangulate(
+            bm, faces=splittable, quad_method="BEAUTY", ngon_method="BEAUTY"
+        )
+        bm.to_mesh(me)
+    bm.free()
+    if splittable:
+        me.update()
+    return len(splittable), unrepairable
+
+
+def min_rest_condition() -> float:
+    """The smallest rest-shape conditioning the solver can carry, computed
+    rather than written down: ``sqrt(float32 eps)``.
+
+    A shell face's rest matrix is inverted once at scene build and the elastic
+    Hessian is quadratic in that inverse, so a face conditioned at ratio ``r``
+    holds its Hessian entries to a relative precision of about
+    ``float32 eps / r**2``. At ``r = sqrt(float32 eps)`` that reaches 1 and no
+    correct digit is left. The solver's own gate,
+    ``builder::REST_SHAPE_MIN_CONDITION``, is the same number and carries the
+    full derivation; both gates have to grant the same set, so neither side
+    rounds it.
+    """
+    import numpy as np
+
+    return float(np.sqrt(np.finfo(np.float32).eps))
+
+
+def _triangle_conditioning(corners):
+    """Per-triangle ``smin / smax`` of the rest tangent matrix, given an
+    ``(N, 3, 3)`` array of triangle corner positions.
+
+    This is the exact quantity ``builder::invert_rest_or_panic2`` tests, formed
+    without an SVD. The two rest edge vectors ``e0 = c1 - c0`` and
+    ``e1 = c2 - c0`` make a 3x2 matrix ``D`` whose singular values are what the
+    solver's tangent-frame projection preserves. ``D.T @ D`` is 2x2, its
+    determinant is ``(s0 * s1) ** 2`` and its larger eigenvalue is ``s0 ** 2``,
+    so the ratio is ``sqrt(det) / s0 ** 2`` in closed form.
+
+    A degenerate triangle returns ``0.0``: zero area gives ``det == 0``, and
+    three coincident corners give a zero matrix, which the guarded divide sends
+    to zero rather than to NaN.
+    """
+    import numpy as np
+
+    e0 = corners[:, 1] - corners[:, 0]
+    e1 = corners[:, 2] - corners[:, 0]
+    g00 = np.einsum("ij,ij->i", e0, e0)
+    g01 = np.einsum("ij,ij->i", e0, e1)
+    g11 = np.einsum("ij,ij->i", e1, e1)
+    trace = g00 + g11
+    det = np.maximum(g00 * g11 - g01 * g01, 0.0)
+    disc = np.sqrt(np.maximum(trace * trace - 4.0 * det, 0.0))
+    smax_sq = 0.5 * (trace + disc)
+    ratio = np.zeros(len(corners), dtype=np.float64)
+    np.divide(np.sqrt(det), smax_sq, out=ratio, where=smax_sq > 0.0)
+    return ratio
+
+
+def _fill_is_sound(tris, loop_co_world) -> bool:
+    """Whether every triangle of one fill clears :func:`min_rest_condition`.
+
+    Measured on the WORLD-linear corners, which is what the gate flags and what
+    the solver's rest shape is built from. The FILL itself was chosen from the
+    local corners, the space the repair runs bmesh in.
+    """
+    import numpy as np
+
+    if not tris:
+        return False
+    corners = np.array(
+        [[loop_co_world[i] for i in t] for t in tris], dtype=np.float64
+    )
+    return bool(_triangle_conditioning(corners).min() >= min_rest_condition())
+
+
+def _beauty_triangulations(polygons_local):
+    """BEAUTY fills for many polygons, in one scratch bmesh.
+
+    Returns one list of index triples per input polygon, in order, with ``[]``
+    for a polygon Blender refuses to rebuild. A polygon of fewer than four
+    corners is its own only triangulation and gets ``[]``, since no re-split
+    exists to offer.
+    """
+    import bmesh
+    from mathutils import Vector
+
+    bm = bmesh.new()
+    try:
+        faces, offsets = [], []
+        for loop_co in polygons_local:
+            if len(loop_co) < 4:
+                faces.append(None)
+                offsets.append(None)
+                continue
+            base = len(bm.verts)
+            verts = [bm.verts.new(Vector(c)) for c in loop_co]
+            try:
+                faces.append(bm.faces.new(verts))
+            except (ValueError, RuntimeError):
+                faces.append(None)
+            offsets.append(base)
+        if not any(f is not None for f in faces):
+            return [[] for _ in polygons_local]
+        # An n-gon fill is projected through the face normal, and a face built
+        # by hand carries (0, 0, 0) until the mesh is asked for one.
+        bm.normal_update()
+        bm.verts.index_update()
+        owner = {}
+        for i, face in enumerate(faces):
+            if face is not None:
+                for v in face.verts:
+                    owner[v.index] = i
+        bmesh.ops.triangulate(
+            bm,
+            faces=[f for f in faces if f is not None],
+            quad_method="BEAUTY",
+            ngon_method="BEAUTY",
+        )
+        bm.verts.index_update()
+        out = [[] for _ in polygons_local]
+        for tri in bm.faces:
+            indices = [v.index for v in tri.verts]
+            which = owner.get(indices[0])
+            if which is None or offsets[which] is None:
+                continue
+            out[which].append(tuple(i - offsets[which] for i in indices))
+        return out
+    finally:
+        bm.free()
+
+
+def find_degenerate_tessellation(obj, local_verts=None, conditioning=True) -> dict:
+    """Locate triangles with no usable rest shape in the tessellation the
+    encoder ships.
+
+    Returns ``{"count", "polygons", "repairable_polygons", "triangle_polygons",
+    "all_repairable_by_triangulation"}``: how many of ``loop_triangles`` fall
+    below :func:`min_rest_condition`, the source polygon indices they came from
+    (sorted, deduplicated), which of those polygons re-splitting rescues, which
+    of them are ALREADY triangles, and whether re-splitting rescues all of them.
+
+    Three cases reach here and they take three different remedies, which is why
+    the last two keys are separate:
+
+      * every flagged polygon is repairable. The polygons are sound and only
+        Blender's split of them is degenerate. A quad carrying a vertex on, or
+        very near, the straight edge between its neighbors splits along the
+        diagonal that produces a collinear triangle, while Face > Triangulate
+        Faces (Ctrl+T) picks the other one. Nothing about the mesh changes.
+      * a flagged polygon is already a TRIANGLE. It is its own only
+        triangulation, so no split can help and none is offered. Its own
+        geometry is the defect: a corner sits on the line between the other
+        two. The vertex has to move, or the triangle be dissolved into a
+        neighbor.
+      * a flagged polygon of four or more corners has no sound split. A
+        zero-area polygon has none at all, and neither does one with a
+        zero-length boundary edge: every boundary edge belongs to exactly one
+        triangle of any triangulation, so a pair of coincident consecutive
+        vertices forces a degenerate triangle into all of them. That geometry
+        has to be merged or dissolved.
+
+    Shipping such a triangle costs the artist the run, in one of two ways that
+    look nothing alike. An exactly zero-area one aborts at scene build with
+    ``degenerate face {i}: area is zero (collinear or duplicate vertex
+    indices)`` from ``triutils::face_areas``. A merely near-collinear one clears
+    that assertion, inverts to a finite but enormous ``inv_rest``, and reaches
+    the linear solve as a non-finite Hessian, which reports
+    ``p^T A p is not-a-number at iter 0`` and names no geometry (issue #144).
+    Both abort only after an upload and a build, and both name an index into
+    the solver's own concatenated mesh, so the dynamics pipeline refuses the
+    Transfer here instead, where the object still has a name and the artist has
+    a repair.
+
+    The test is the conditioning of the rest matrix, not an area threshold: it
+    is the quantity that decides whether the inverse rest shape survives fp32,
+    and a merely thin triangle above it is legitimate geometry the solver
+    handles. The measurement is float64 through the object's world transform,
+    the same positions the solver builds its rest shape from.
+
+    This gate and ``builder::invert_rest_or_panic2`` use the same threshold and
+    agree for a group with isotropic shrink, which is the default. They can
+    diverge when ``shrink-x`` and ``shrink-y`` differ: the solver tests the
+    matrix it actually inverts, after the UV rotation and the per-axis shrink,
+    and this gate measures raw corner positions and never sees either. The
+    solver's gate is the authoritative one, and refuses what it must.
+
+    `local_verts` is the local-space positions the encoder will actually ship,
+    which is the starting frame's deform-evaluated pose. Passing them is what
+    makes this gate judge the geometry the solver receives rather than the base
+    cage; the repair scan deliberately passes nothing, because a base-mesh
+    re-split is all a repair can change.
+
+    Returns an empty result for non-mesh objects (curves, etc.), which have no
+    polygons in the Blender mesh sense.
+    """
+    empty = {
+        "count": 0,
+        "polygons": [],
+        "repairable_polygons": [],
+        "triangle_polygons": [],
+        "all_repairable_by_triangulation": True,
+    }
+    if obj is None or obj.type != "MESH" or obj.data is None:
+        return empty
+    mesh = obj.data
+    mesh.calc_loop_triangles()
+    if not len(mesh.loop_triangles):
+        return empty
+
+    import numpy as np
+
+    if local_verts is not None and len(local_verts) == len(mesh.vertices):
+        # The positions the encoder will ship: the starting frame's
+        # deform-evaluated pose. Judging the base cage instead lets a shape key
+        # or an armature move a corner onto the line between its neighbors
+        # after the gate has already passed it.
+        co = np.asarray(local_verts, dtype=np.float64).reshape(-1, 3)
+    else:
+        co = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", co)
+        co = co.reshape(-1, 3)
+    # The LOCAL corners are kept: a candidate triangulation is chosen in the
+    # space the repair runs bmesh in, not in the measurement space below.
+    co_local = co
+    # Only the linear part of the transform: a translation cancels in the edge
+    # vectors, while a non-uniform scale genuinely changes every triangle's
+    # aspect ratio and so belongs in the measurement.
+    linear = np.array(obj.matrix_world.to_3x3(), dtype=np.float64)
+    co = co @ linear.T
+
+    n_tri = len(mesh.loop_triangles)
+    tri = np.empty(n_tri * 3, dtype=np.uint32)
+    mesh.loop_triangles.foreach_get("vertices", tri)
+    tri = tri.reshape(n_tri, 3)
+    # `conditioning=False` is for triangles that never reach a rest-shape
+    # inversion: a stationary STATIC collider and an fTetWild SOLID's surface
+    # both go to `make_collision_mesh`, whose only per-triangle check is that
+    # the area is positive. Refusing those on conditioning would reject
+    # geometry the solver accepts.
+    ratios = _triangle_conditioning(co[tri])
+    floor = min_rest_condition() if conditioning else 0.0
+    bad = np.flatnonzero(ratios <= floor if not conditioning else ratios < floor)
+    if not len(bad):
+        return empty
+
+    poly_index = np.empty(n_tri, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("polygon_index", poly_index)
+    polygons = sorted({int(p) for p in poly_index[bad]})
+
+    # One scratch bmesh for every flagged polygon rather than one each: this
+    # runs on the blocking main thread at Transfer, and a mesh with many
+    # offenders paid an allocate and free per polygon.
+    loops = [list(mesh.polygons[p].vertices) for p in polygons]
+    fills = _beauty_triangulations([co_local[loop] for loop in loops])
+    repairable = [
+        p
+        for p, loop, fill in zip(polygons, loops, fills)
+        if _fill_is_sound(fill, co[loop])
+    ]
+    triangles = [p for p in polygons if len(mesh.polygons[p].vertices) == 3]
+    return {
+        "count": int(len(bad)),
+        "polygons": polygons,
+        # The subset re-splitting rescues, so a repair splits exactly those and
+        # leaves the rest alone. Splitting a polygon that has no sound
+        # triangulation changes the mesh without fixing anything: every
+        # triangulation of it still contains a degenerate triangle.
+        "repairable_polygons": repairable,
+        # Already triangles, so no split exists to offer. Reported separately
+        # because the remedy is a change to the geometry, not to its split.
+        "triangle_polygons": triangles,
+        "all_repairable_by_triangulation": len(repairable) == len(polygons),
+    }
 
 
 def find_linked_duplicate_siblings(obj) -> list[str]:

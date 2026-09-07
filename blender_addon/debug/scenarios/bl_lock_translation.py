@@ -65,12 +65,12 @@ def _resolve(group, obj_name):
     raise RuntimeError(f"could not resolve assigned object '{obj_name}'")
 
 
-def _lock_dict(dh, uuids):
+def _lock_dict(dh, uuids, key="lock-translation"):
     param_bytes = dh.encoder_param.encode_param(bpy.context)
     decoded = dh.decode_addon_blob(param_bytes)
     for params, _objs, object_uuids in decoded["group"]:
         if any(u in object_uuids for u in uuids):
-            return params.get("lock-translation", {})
+            return params.get(key, {})
     raise RuntimeError("could not locate the group in decoded params")
 
 
@@ -212,6 +212,63 @@ try:
             "hidden_batch_count": len(hidden_batches),
         },
     )
+
+    # ----- G: Lock All Translations replaces the axis on the wire -----
+    # The axis dict and the all dict are two spellings of one lock state, and
+    # exactly one of them may claim a given object: the axis encoder rejects
+    # the zero axis an all-axes record requires, and the solver asserts the
+    # biconditional (all mode if and only if a zero axis). So turning the
+    # checkbox on must move this object OUT of "lock-translation" and INTO
+    # "lock-all-translations", not add it to both.
+    #
+    # This subtest also settles which TREE the rig loaded: `lock_translation_all`
+    # exists only where this feature is checked out, so an addon symlinked
+    # elsewhere raises AttributeError here instead of quietly passing the rest.
+    a_assigned.lock_translation_all = True
+    all_dict = _lock_dict(dh, [uuid_a, uuid_b], "lock-all-translations")
+    axis_dict = _lock_dict(dh, [uuid_a, uuid_b], "lock-translation")
+    dh.record(
+        "G_all_translations_replaces_the_axis_entry",
+        all_dict.get(uuid_a) is True and uuid_a not in axis_dict,
+        {"all_dict": {k: bool(v) for k, v in all_dict.items()},
+         "axis_keys": list(axis_dict.keys())},
+    )
+
+    # ----- H: unticking restores the axis entry unchanged --------------
+    # The panel disables the axis field rather than clearing it, so the value
+    # the artist typed has to survive a trip through the all-axes mode.
+    a_assigned.lock_translation_all = False
+    restored = _lock_dict(dh, [uuid_a, uuid_b])
+    axis_restored = restored.get(uuid_a)
+    dh.record(
+        "H_unticking_restores_the_axis",
+        axis_restored is not None
+        and math.isclose(axis_restored[2], -1.0, abs_tol=1e-9),
+        {"axis": list(axis_restored) if axis_restored is not None else None},
+    )
+
+    # ----- I: an all-locked object with a ZEROED axis still encodes ----
+    # The panel stops showing "Axis is zero; scene build will fail" while an
+    # all-axes lock is on, because a zero axis is the CORRECT thing to send
+    # then. That suppression is only honest if the encoder agrees: the axis
+    # validator raises on a zero-length axis, so an object left at (0,0,0)
+    # would otherwise turn a legal scene into a build failure with a message
+    # naming an axis the artist was told to ignore.
+    a_assigned.lock_translation_all = True
+    a_assigned.lock_translation_axis = (0.0, 0.0, 0.0)
+    encode_ok, encode_detail = True, "encoded"
+    try:
+        zero_all = _lock_dict(dh, [uuid_a, uuid_b], "lock-all-translations")
+        zero_axis = _lock_dict(dh, [uuid_a, uuid_b], "lock-translation")
+        encode_ok = zero_all.get(uuid_a) is True and uuid_a not in zero_axis
+        encode_detail = {"all": bool(zero_all.get(uuid_a)),
+                         "axis_keys": list(zero_axis.keys())}
+    except Exception as encode_exc:  # noqa: BLE001 - the failure IS the result
+        encode_ok = False
+        encode_detail = f"{type(encode_exc).__name__}: {encode_exc}"
+    dh.record("I_all_lock_with_zero_axis_encodes", encode_ok, encode_detail)
+    a_assigned.lock_translation_all = False
+    a_assigned.lock_translation_axis = (0.0, 3.0, 0.0)
 
 except Exception as exc:
     result["errors"].append(f"{type(exc).__name__}: {exc}")

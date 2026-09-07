@@ -7,6 +7,7 @@ from . import (
     bake_ops,
     collision_window_ops,
     dyn_param_ops,
+    material_map_ops,
     export_ops,
     group_ops,
     invisible_collider_ops,
@@ -242,6 +243,7 @@ def register():
     bake_ops.register()
     export_ops.register()
     dyn_param_ops.register()
+    material_map_ops.register()
     invisible_collider_ops.register()
     pin_ops.register()
     pin_capture_ops.register()
@@ -273,6 +275,7 @@ def unregister():
     static_deform_ops.unregister()
     pin_capture_ops.unregister()
     pin_ops.unregister()
+    material_map_ops.unregister()
     dyn_param_ops.unregister()
     export_ops.unregister()
     bake_ops.unregister()

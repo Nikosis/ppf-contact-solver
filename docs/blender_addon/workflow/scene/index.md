@@ -14,6 +14,15 @@ already inside out. Before you transfer, confirm that every mesh is
 cleanly separated from every other mesh and that no mesh folds
 through itself. This rule applies to every object type: Solid, Shell,
 Rod, PDRD, and Static.
+
+Where a mesh cannot be separated up front and the simulation is
+expected to resolve the overlap instead, a garment fitted onto a posed
+character being the usual case, the group settings under
+[Allow Intersections](../params/material.md#allow-intersections) accept
+the overlap rather than refusing it. Set them on the group that is
+simulated: a **Static** collider left in its rest pose carries
+neither. They suppress the report only: the surfaces are still in
+contact and the solver still pushes them apart.
 :::
 
 :::{note}

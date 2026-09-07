@@ -252,12 +252,21 @@ fn decode_pin_header(d: &Bound<'_, PyDict>) -> PyResult<sl::PinHeader> {
         .map(|v| v.extract::<Option<String>>())
         .transpose()?
         .flatten();
+    // Absent for a PinData built before the field existed, which reads as
+    // "this pin claims nothing".
+    let allow_intersection: bool = d
+        .get_item("allow_intersection")?
+        .map(|v| v.extract::<Option<bool>>())
+        .transpose()?
+        .flatten()
+        .unwrap_or(false);
     Ok(sl::PinHeader {
         operation_count,
         pin_count,
         pull_strength,
         unpin_time,
         pin_group_id,
+        allow_intersection,
     })
 }
 

@@ -36,6 +36,23 @@ from ._scene_transform_ import (
 EPS = 1e-3
 
 
+def _interp_samples(samples: list, times: list, time: float):
+    """`samples` linearly interpolated at `time`, holding at both ends.
+
+    `times` is strictly increasing. A time before the first sample or after the
+    last one takes that sample unchanged, which is how the solver reads its own
+    keyframe times, so the host and the device agree outside the authored range.
+    """
+    if len(samples) == 1 or time <= times[0]:
+        return samples[0]
+    if time >= times[-1]:
+        return samples[-1]
+    hi = next(i for i, t in enumerate(times) if t > time)
+    span = times[hi] - times[hi - 1]
+    alpha = (time - times[hi - 1]) / span
+    return samples[hi - 1] + (samples[hi] - samples[hi - 1]) * alpha
+
+
 class Object:
     """The object class.
 
@@ -63,6 +80,17 @@ class Object:
         self._static = False
         self._is_pdrd = False
         self._param = ParamHolder(object_param(self.obj_type))
+        # Per-key animated material values, one entry per keyframe in the
+        # scene's shared `param_anim_times`. Empty for an object whose
+        # materials are constant, which is every object unless the caller
+        # keyframed a slider.
+        self._param_anim: dict[str, list[float]] = {}
+        # Spatial material maps: key -> (per-vertex weights, target value).
+        # The effective value is lerp(base, target, w) with `base` the object's
+        # ordinary param, so a weight of 0 reproduces the unmapped result
+        # exactly and the calibrated presets keep their meaning.
+        self._param_spatial: dict[str, tuple[list, list[float], float]] = {}
+        self._param_spatial_elem: dict[tuple[str, str], list] = {}
         self.clear()
 
     @property
@@ -122,6 +150,196 @@ class Object:
                 assert not obj.visible
         """
         return self._visible
+
+    def _claim_param_spatial(self, key: str) -> None:
+        """Reserve `key` for one map, refusing a second one or a bad key."""
+        if key not in self._param.key_list():
+            raise KeyError(
+                f"Parameter '{key}' not found on a '{self.obj_type}' object, "
+                "so it cannot carry a spatial map"
+            )
+        if key in self._param_spatial:
+            raise ValueError(
+                f"'{key}' already carries a spatial map on this object; each "
+                "parameter takes at most one"
+            )
+        if self.get("F") is None and self.get("T") is None:
+            raise ValueError(
+                f"a spatial map for '{key}' needs an object with elements to "
+                f"reduce over; a '{self.obj_type}' object has neither faces "
+                "nor tetrahedra"
+            )
+
+    def _validated_weights(self, key: str, weights, where: str = "") -> np.ndarray:
+        """`weights` as one float32 value per vertex, in [0, 1]."""
+        w = np.asarray(weights, dtype=np.float32).ravel()
+        n_vert = len(self.get("V"))
+        if len(w) != n_vert:
+            raise ValueError(
+                f"spatial map for '{key}'{where} has {len(w)} weights but the "
+                f"object has {n_vert} vertices"
+            )
+        if not np.all(np.isfinite(w)):
+            raise ValueError(
+                f"spatial map for '{key}'{where} contains non-finite weights"
+            )
+        if w.min() < 0.0 or w.max() > 1.0:
+            raise ValueError(
+                f"spatial map weights for '{key}'{where} must lie in [0, 1], "
+                f"got [{float(w.min())}, {float(w.max())}]"
+            )
+        return w
+
+    def set_param_spatial(self, key: str, weights, target: float) -> "Object":
+        """Vary one material parameter across this object's elements.
+
+        The effective value at a vertex is ``lerp(base, target, w)``, where
+        ``base`` is the object's ordinary parameter. A weight of 0 therefore
+        reproduces the unmapped result exactly, which is what keeps the
+        calibrated material presets meaningful.
+
+        Each element takes the MEAN of its own vertices' weights. A coefficient
+        that varied inside an element would make the force stop being the
+        gradient of any energy, and its Hessian stop being the one the PSD
+        projection was derived for, so the reduction to one value per element
+        happens here rather than being left to the solver.
+
+        Args:
+            key (str): The material parameter key. Must exist on this object.
+            weights: One weight per vertex of this object, each in [0, 1].
+            target (float): The value reached where the weight is 1.
+
+        Returns:
+            Object: This object, for chaining.
+        """
+        self._claim_param_spatial(key)
+        w = self._validated_weights(key, weights)
+        self._param_spatial[key] = ([w], [0.0], float(target))
+        return self
+
+    def set_param_spatial_anim(
+        self, key: str, weight_frames, times, target: float
+    ) -> "Object":
+        """Vary one material parameter across elements AND over time.
+
+        `weight_frames[i]` holds the weights at `times[i]`, and the weights at
+        an intermediate time are the linear interpolation of the two samples
+        that bracket it. Outside the authored range the nearest sample holds,
+        matching how the solver reads its own keyframe times.
+
+        Args:
+            key (str): The material parameter key. Must exist on this object.
+            weight_frames: One weight array per entry in `times`.
+            times (list[float]): Strictly increasing simulated times, starting
+                at 0.0 so every solve time is bracketed or clamped.
+            target (float): The value reached where the weight is 1.
+
+        Returns:
+            Object: This object, for chaining.
+        """
+        self._claim_param_spatial(key)
+        t = [float(x) for x in times]
+        if len(weight_frames) != len(t):
+            raise ValueError(
+                f"spatial map for '{key}' has {len(weight_frames)} weight "
+                f"arrays for {len(t)} times"
+            )
+        if not t:
+            raise ValueError(f"spatial map for '{key}' has no samples")
+        if t[0] != 0.0:
+            raise ValueError(
+                f"spatial map for '{key}' starts at time {t[0]}; the first "
+                "sample is the map at simulated time zero"
+            )
+        if any(b <= a for a, b in zip(t, t[1:])):
+            raise ValueError(
+                f"spatial map times for '{key}' must strictly increase, got {t}"
+            )
+        frames = [
+            self._validated_weights(key, w, f" at sample {i}")
+            for i, w in enumerate(weight_frames)
+        ]
+        self._param_spatial[key] = (frames, t, float(target))
+        return self
+
+    @property
+    def param_spatial(self) -> dict:
+        """Spatial material maps, keyed by parameter."""
+        return self._param_spatial
+
+    @property
+    def animated_spatial_keys(self) -> list[str]:
+        """Parameters whose map changes over time."""
+        return [k for k, (frames, _t, _target) in self._param_spatial.items()
+                if len(frames) > 1]
+
+    def _reduced_weights(self, key: str, element_key: str) -> list:
+        """`key`'s weight samples reduced to one coefficient per element."""
+        cached = self._param_spatial_elem.get((key, element_key))
+        if cached is not None:
+            return cached
+        elements = self.get(element_key)
+        if elements is None:
+            raise ValueError(
+                f"a spatial map for '{key}' needs a '{element_key}' element "
+                f"table; a '{self.obj_type}' object has none"
+            )
+        idx = np.asarray(elements)
+        frames, _times, _target = self._param_spatial[key]
+        # Mean of the element's own vertices: one coefficient per element.
+        reduced = [w[idx].mean(axis=1) for w in frames]
+        self._param_spatial_elem[(key, element_key)] = reduced
+        return reduced
+
+    def element_param_values(
+        self, key: str, base: float, time: float, element_key: str = "F"
+    ) -> Optional[np.ndarray]:
+        """This object's per-element values for `key`, or None with no map.
+
+        `base` is the value the map blends away from, which is the object's
+        static parameter for an unanimated key and that frame's value for an
+        animated one, so a parameter can be animated and mapped at once.
+        `element_key` names the asset's connectivity array: "F" for surface
+        triangles, "T" for tetrahedra.
+
+        The element mean and the interpolation over time commute, because the
+        mean is linear, so the weights are reduced once per element table and
+        the interpolation runs on the reduced arrays.
+        """
+        entry = self._param_spatial.get(key)
+        if entry is None:
+            return None
+        _frames, times, target = entry
+        reduced = self._reduced_weights(key, element_key)
+        w_elem = _interp_samples(reduced, times, time)
+        return base + (target - base) * w_elem
+
+    def set_param_anim(self, key: str, values: list[float]) -> "Object":
+        """Animate one material parameter over the scene's keyframe times.
+
+        Args:
+            key (str): The material parameter key, as registered in
+                ``object_param``. Must already exist on this object.
+            values (list[float]): One value per entry in the scene's
+                ``param_anim_times``, in the same order.
+
+        Returns:
+            Object: This object, for chaining.
+        """
+        if key not in self._param.key_list():
+            raise KeyError(
+                f"Parameter '{key}' not found on a '{self.obj_type}' object, "
+                "so it cannot be animated"
+            )
+        if not values:
+            raise ValueError(f"Animated parameter '{key}' needs at least one value")
+        self._param_anim[key] = [float(v) for v in values]
+        return self
+
+    @property
+    def param_anim(self) -> dict[str, list[float]]:
+        """Animated material values, keyed by parameter, one entry per keyframe."""
+        return self._param_anim
 
     @property
     def param(self) -> ParamHolder:
@@ -275,6 +493,15 @@ class Object:
         # initial position along this direction; rotation and deformation
         # stay free. See :meth:`lock_translation`.
         self._translation_lock: Optional[np.ndarray] = None
+        # Lock All Translations: True pins the mass-weighted center of
+        # mass to its initial POINT rather than to a line. No direction
+        # is meaningful in that mode, so `_translation_lock` is None
+        # whenever this is True and the two are mutually exclusive. THE
+        # FLAG CARRIES THE ENABLE BIT: "is this object's translation
+        # locked?" is `_translation_lock is not None or
+        # _translation_lock_all`, never the axis alone. See
+        # :meth:`lock_all_translations`.
+        self._translation_lock_all: bool = False
         # Lock Rotation axis: None = free (unlocked), or a unit-length
         # world-space direction vector. The solver later restricts this
         # object's mass-weighted best-fit rigid rotation to rotation
@@ -289,6 +516,13 @@ class Object:
         # while `_rotation_lock` is None. See
         # :meth:`lock_rotation_prohibit_axis`.
         self._rotation_lock_prohibit_axis: bool = False
+        # Lock All Rotations: True forbids net rotation about every axis.
+        # Neither an axis nor the whitelist/blacklist mode above is
+        # meaningful in that mode, so `_rotation_lock` is None and
+        # `_rotation_lock_prohibit_axis` is False whenever this is True.
+        # THE FLAG CARRIES THE ENABLE BIT, exactly as for translation
+        # above. See :meth:`lock_all_rotations`.
+        self._rotation_lock_all: bool = False
         self._velocity_schedule = []
         # Principal-axis angular velocity overwrite keyframes:
         # list of (time, pca_index, speed_rad_per_s). The spin axis is the
@@ -1117,6 +1351,11 @@ class Object:
         this stays free (the disabled state), matching a zero vector in
         the exported ``translation_lock.bin`` table.
 
+        This and :meth:`lock_all_translations` are the two spellings of
+        Lock Translation and the last call wins: setting an axis here
+        clears the all-axes flag, so the object holds exactly one of an
+        axis and the flag at any time.
+
         Args:
             x, y, z: World-space direction of the allowed line of motion.
                 Must be finite and non-zero; normalized internally (only
@@ -1144,6 +1383,44 @@ class Object:
         if norm <= 0.0:
             raise ValueError("lock_translation() axis must be non-zero")
         self._translation_lock = axis / norm
+        self._translation_lock_all = False
+        return self
+
+    def lock_all_translations(self) -> "Object":
+        """Pin this object's center of mass to a fixed world-space point.
+
+        The solver holds the object's mass-weighted center of mass at
+        its initial position, removing all three translational degrees
+        of freedom. Rotation and deformation stay free, and this
+        coexists independently with the Lock Rotation family. Works for
+        any dynamic object type (SOLID, SHELL, ROD, PDRD, SAND).
+
+        This takes no axis because there is no direction to give: every
+        direction is locked. It is a separate method rather than a mode
+        argument on :meth:`lock_translation` so that the finite and
+        non-zero axis validation there always runs on a real axis,
+        instead of being skipped for a mode that carries none.
+
+        This and :meth:`lock_translation` are the two spellings of Lock
+        Translation and the last call wins: enabling all axes here
+        clears any axis already set, so the exported record has one
+        canonical spelling (a zero axis row beside the all-axes mode).
+
+        Returns:
+            Object: ``self``, for chaining.
+
+        Raises:
+            ValueError: if the object is static.
+
+        Example:
+            Hold a hanging lantern's center of mass in place while it
+            swings and deforms freely::
+
+                scene.add("lantern").lock_all_translations()
+        """
+        _rust.scene_validate_object_not_static(bool(self.static))
+        self._translation_lock_all = True
+        self._translation_lock = None
         return self
 
     def lock_rotation(self, x: float = 1.0, y: float = 0.0, z: float = 0.0) -> "Object":
@@ -1160,6 +1437,11 @@ class Object:
         There is no separate "unlock" call: an object that never calls
         this stays free (the disabled state), matching a zero vector in
         the exported ``rotation_lock.bin`` table.
+
+        This and :meth:`lock_all_rotations` are the two spellings of
+        Lock Rotation and the last call wins: setting an axis here
+        clears the all-axes flag, so the object holds exactly one of an
+        axis and the flag at any time.
 
         Args:
             x, y, z: World-space direction of the allowed rotation axis.
@@ -1189,6 +1471,47 @@ class Object:
         if norm <= 0.0:
             raise ValueError("lock_rotation() axis must be non-zero")
         self._rotation_lock = axis / norm
+        self._rotation_lock_all = False
+        return self
+
+    def lock_all_rotations(self) -> "Object":
+        """Forbid this object's rigid rotation about every world axis.
+
+        The solver removes all three rotational degrees of freedom from
+        the object's mass-weighted best-fit rigid rotation, so it keeps
+        its orientation. Translation and deformation stay free, and this
+        coexists independently with the Lock Translation family. Works
+        for any dynamic object type (SOLID, SHELL, ROD, PDRD, SAND).
+
+        This takes no axis because there is no direction to give: every
+        direction is locked. It is a separate method rather than a mode
+        argument on :meth:`lock_rotation` so that the finite and
+        non-zero axis validation there always runs on a real axis,
+        instead of being skipped for a mode that carries none.
+
+        This and :meth:`lock_rotation` are the two spellings of Lock
+        Rotation and the last call wins: enabling all axes here clears
+        any axis already set and resets the whitelist/blacklist mode
+        of :meth:`lock_rotation_prohibit_axis`, which has no axis left
+        to modify. The exported record then has one canonical spelling
+        (a zero axis row beside the all-axes mode).
+
+        Returns:
+            Object: ``self``, for chaining.
+
+        Raises:
+            ValueError: if the object is static.
+
+        Example:
+            Let a sign board sway on its chains without ever turning to
+            face away from the street::
+
+                scene.add("sign").lock_all_rotations()
+        """
+        _rust.scene_validate_object_not_static(bool(self.static))
+        self._rotation_lock_all = True
+        self._rotation_lock = None
+        self._rotation_lock_prohibit_axis = False
         return self
 
     def lock_rotation_prohibit_axis(self, prohibit: bool = True) -> "Object":
@@ -1212,9 +1535,10 @@ class Object:
             Object: ``self``, for chaining.
 
         Raises:
-            ValueError: if :meth:`lock_rotation` has not been called on
-                this object yet, since there is no axis for the mode to
-                modify.
+            ValueError: if the object holds no rotation-lock axis, either
+                because :meth:`lock_rotation` has not been called on it
+                yet or because :meth:`lock_all_rotations` is in effect;
+                there is no axis for the mode to modify in either case.
 
         Example:
             Forbid a wheel from spinning about its own drive axle while
@@ -1417,7 +1741,8 @@ class Object:
             [list(p.index) for p in self._pin],
         )
 
-    def pin(self, ind: Optional[list[int]] = None) -> PinHolder:
+    def pin(self, ind: Optional[list[int]] = None,
+            allow_intersection: bool = False) -> PinHolder:
         """Set specified vertices as pinned.
 
         An object with every vertex pinned is a *static collider*:
@@ -1429,6 +1754,14 @@ class Object:
         Args:
             ind (Optional[list[int]], optional): The indices of the vertices to pin.
             If None, all vertices are pinned. Defaults to None.
+            allow_intersection (bool, optional): Tolerate intersections of the
+            elements this pin FULLY covers instead of reporting them. An
+            element qualifies only when every one of its vertices is pinned
+            and every pin covering those vertices set this, so a partially
+            pinned band is unaffected. Use it for a pinned region whose
+            prescribed placement the solver was never going to resolve, such
+            as a garment band captured from a rig-deformed pose. Defaults to
+            False.
 
         Returns:
             PinHolder: The pin holder.
@@ -1446,6 +1779,7 @@ class Object:
             ind = list(range(len(vert)))
 
         holder = PinHolder(self, ind)
+        holder._data.allow_intersection = bool(allow_intersection)
         self._pin.append(holder)
         return holder
 

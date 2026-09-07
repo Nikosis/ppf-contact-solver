@@ -18,6 +18,7 @@ import tomllib
 from bpy.app.translations import pgettext_iface as iface_, pgettext_tip as tip_
 
 from .param_introspect import MATERIAL_CLIPBOARD_EXCLUDE
+from ..models.material_locks import locked_props
 from .profile import _VECTOR_PROPERTIES
 
 # <addon>/presets/materials.toml, resolved relative to this file
@@ -107,8 +108,15 @@ def apply_material_preset(name: str, group) -> bool:
     if not preset:
         return False
     rna_props = group.bl_rna.properties
+    # A locked parameter keeps its value. The padlock beside it guards against
+    # the tools that overwrite a whole group at once, and a preset is exactly
+    # that; Blender's own lock_location reads the same way against transform
+    # tools. Animation is unaffected: a locked channel still takes its F-curve.
+    locked = locked_props(group)
     for key, value in preset.items():
         if key in _SKIP_KEYS:
+            continue
+        if key in locked:
             continue
         if key not in rna_props:
             continue

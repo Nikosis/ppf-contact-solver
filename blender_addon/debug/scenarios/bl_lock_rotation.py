@@ -91,6 +91,7 @@ def _lock_dicts(dh, uuids):
                 params.get("lock-rotation", {}),
                 params.get("lock-translation", {}),
                 params.get("lock-rotation-prohibit-axis", {}),
+                params.get("lock-all-rotations", {}),
             )
     raise RuntimeError("could not locate the group in decoded params")
 
@@ -125,7 +126,7 @@ try:
     uuid_b = b_assigned.uuid
 
     # ----- A: enabled body's axis is swapped Blender->solver, unit ---
-    rot_lock, _trans_lock, _prohibit_lock = _lock_dicts(dh, [uuid_a, uuid_b])
+    rot_lock, _trans_lock, _prohibit_lock, _all_rot = _lock_dicts(dh, [uuid_a, uuid_b])
     axis_a = rot_lock.get(uuid_a)
     # Blender (x, y, z) -> solver (x, z, -y): (0, 3, 0) -> (0, 0, -3),
     # normalized -> (0, 0, -1).
@@ -161,7 +162,7 @@ try:
     sand_assigned = _resolve(sand_group, "RotLockSand")
     sand_assigned.lock_rotation_enable = True
     sand_assigned.lock_rotation_axis = (1.0, 0.0, 0.0)
-    sand_rot_lock, _, _ = _lock_dicts(dh, [sand_assigned.uuid])
+    sand_rot_lock, _, _, _all_rot = _lock_dicts(dh, [sand_assigned.uuid])
     sand_axis = sand_rot_lock.get(sand_assigned.uuid)
     sand_ok = (
         sand_axis is not None
@@ -188,7 +189,7 @@ try:
     # free rotation to lock.
     static_assigned.lock_rotation_enable = True
     static_assigned.lock_rotation_axis = (1.0, 0.0, 0.0)
-    static_rot_lock, _, static_prohibit_lock = _lock_dicts(dh, [static_assigned.uuid])
+    static_rot_lock, _, static_prohibit_lock, _all_rot = _lock_dicts(dh, [static_assigned.uuid])
     dh.record(
         "D_static_group_prunes_lock_rotation",
         static_assigned.uuid not in static_rot_lock,
@@ -241,7 +242,7 @@ try:
     # ----- G: Lock Translation and Lock Rotation are independent -------
     a_assigned.lock_translation_enable = True
     a_assigned.lock_translation_axis = (1.0, 0.0, 0.0)
-    rot_lock2, trans_lock2, _prohibit_lock2 = _lock_dicts(dh, [uuid_a, uuid_b])
+    rot_lock2, trans_lock2, _prohibit_lock2, _all_rot = _lock_dicts(dh, [uuid_a, uuid_b])
     both_ok = (
         uuid_a in rot_lock2
         and uuid_a in trans_lock2
@@ -262,7 +263,7 @@ try:
     b_assigned.lock_rotation_enable = True
     b_assigned.lock_rotation_axis = (0.0, 0.0, 2.0)
     b_assigned.lock_rotation_prohibit_axis = False
-    _rot_lock3, _trans_lock3, prohibit_lock = _lock_dicts(dh, [uuid_a, uuid_b])
+    _rot_lock3, _trans_lock3, prohibit_lock, _all_rot = _lock_dicts(dh, [uuid_a, uuid_b])
     h_ok = (
         prohibit_lock.get(uuid_a) is True
         and prohibit_lock.get(uuid_b) is False
@@ -308,6 +309,29 @@ try:
         abs(center_shift[2] - 2.0) < 1e-4,
         {"center_shift": center_shift},
     )
+
+    # ----- J: Lock All Rotations replaces BOTH the axis and the mode ---
+    # An all-axes rotation has no axis and no allow-only/prohibit choice to
+    # make, so the encoder must drop this object from "lock-rotation" AND from
+    # "lock-rotation-prohibit-axis". Leaving the prohibit entry behind would
+    # reach the decoder's "no matching lock-rotation axis" raise and abort
+    # every all-locked scene, so the negative half here is the load-bearing
+    # one.
+    #
+    # `lock_rotation_all` exists only in a tree with this feature checked out,
+    # so this subtest also settles which addon the rig actually loaded.
+    a_assigned.lock_rotation_all = True
+    rot, _trans, prohibit, all_rot = _lock_dicts(dh, [uuid_a, uuid_b])
+    dh.record(
+        "J_all_rotations_replaces_axis_and_mode",
+        all_rot.get(uuid_a) is True
+        and uuid_a not in rot
+        and uuid_a not in prohibit,
+        {"all_rot": {k: bool(v) for k, v in all_rot.items()},
+         "axis_keys": list(rot.keys()),
+         "prohibit_keys": list(prohibit.keys())},
+    )
+    a_assigned.lock_rotation_all = False
 
 except Exception as exc:
     result["errors"].append(f"{type(exc).__name__}: {exc}")

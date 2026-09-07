@@ -70,7 +70,7 @@ def raises(fn, *args, **kwargs):
 
 CONFIG_TEXT = '''
 Host gpu-host
-    HostName 10.0.0.5
+    HostName 192.0.2.5
     User ubuntu
     IdentityFile ~/.ssh/id_gpu
     ProxyJump inner
@@ -123,7 +123,7 @@ try:
     # ----- A: the config keyword and the resolved chain ---------------
     entry = resolve("gpu-host", 22, config_path)
     record("A_proxyjump_read_from_config",
-           entry.proxy_jump == "inner" and entry.hostname == "10.0.0.5",
+           entry.proxy_jump == "inner" and entry.hostname == "192.0.2.5",
            {"proxy_jump": entry.proxy_jump, "hostname": entry.hostname})
 
     hops = chain("inner", 22, config_path)
@@ -167,7 +167,7 @@ try:
     com = client_mod.communicator
     Entry = ssh_config.SSHConfigEntry
     fake_hosts = {
-        "gpu-host": Entry("10.0.0.5", 22, "ubuntu", "/keys/gpu", "bastion"),
+        "gpu-host": Entry("192.0.2.5", 22, "ubuntu", "/keys/gpu", "bastion"),
         "bastion": Entry("bastion.example.com", 2201, "jump", "/keys/jump", None),
         "other": Entry("other.example.com", 2202, "other-user", None, None),
     }
@@ -183,15 +183,15 @@ try:
     com._dispatch_and_tick = lambda event: captured.append(event)
     try:
         com.connect_ssh(host="gpu-host", port=22, username="", key_path="",
-                        path="/home/ubuntu/dev", proxy_jump=None)
+                        path="~/ppf-contact-solver", proxy_jump=None)
         from_config = captured[-1].config
         com.connect_ssh(host="gpu-host", port=22, username="", key_path="",
-                        path="/home/ubuntu/dev", proxy_jump="other")
+                        path="~/ppf-contact-solver", proxy_jump="other")
         from_field = captured[-1].config
         no_jump_msg = None
         try:
             com.connect_ssh(host="gpu-host", port=22, username="", key_path="",
-                            path="/home/ubuntu/dev", proxy_jump="user@")
+                            path="~/ppf-contact-solver", proxy_jump="user@")
         except ValueError as exc:
             no_jump_msg = str(exc)
     finally:
@@ -267,8 +267,8 @@ try:
     sys.modules["paramiko"] = fake_paramiko
 
     ssh_cfg = {
-        "host": "10.0.0.5", "port": 22, "username": "ubuntu",
-        "key_path": "/keys/gpu", "path": "/home/ubuntu/dev", "container": "",
+        "host": "192.0.2.5", "port": 22, "username": "ubuntu",
+        "key_path": "/keys/gpu", "path": "~/ppf-contact-solver", "container": "",
         "keepalive_interval": 30, "server_port": 9090,
         "jumps": [
             {"host": "outer.example.com", "port": 2201,
@@ -283,12 +283,12 @@ try:
         channels = [e for e in events if e[0] == "channel"]
         record("E_hops_open_in_order",
                [c[1] for c in connects]
-               == ["outer.example.com", "inner.example.com", "10.0.0.5"],
+               == ["outer.example.com", "inner.example.com", "192.0.2.5"],
                {"connects": connects})
 
         record("E_each_hop_tunnels_the_next",
                [c[3] for c in channels]
-               == [("inner.example.com", 2202), ("10.0.0.5", 22)]
+               == [("inner.example.com", 2202), ("192.0.2.5", 22)]
                and [c[1] for c in channels]
                == ["outer.example.com", "inner.example.com"],
                {"channels": channels})
@@ -298,7 +298,7 @@ try:
         record("E_target_rides_the_last_channel",
                connects[0][5] is None
                and connects[1][5] == ("inner.example.com", 2202)
-               and connects[2][5] == ("10.0.0.5", 22),
+               and connects[2][5] == ("192.0.2.5", 22),
                {"socks": [c[5] for c in connects]})
 
         record("E_hop_credentials_are_its_own",
@@ -317,7 +317,7 @@ try:
         backend.disconnect()
         record("E_disconnect_closes_the_chain",
                [e[1] for e in events]
-               == ["10.0.0.5", "inner.example.com", "outer.example.com"],
+               == ["192.0.2.5", "inner.example.com", "outer.example.com"],
                {"closed": [e[1] for e in events]})
 
         # A hop that refuses tears down what was already opened, and names
@@ -336,7 +336,7 @@ try:
         record("E_failed_chain_is_torn_down",
                [e[1] for e in events if e[0] == "close"] == ["outer.example.com"]
                and not [e for e in events
-                        if e[0] == "connect" and e[1] == "10.0.0.5"],
+                        if e[0] == "connect" and e[1] == "192.0.2.5"],
                {"events": events})
 
         # With no jump host the backend connects straight to the target, so
@@ -346,7 +346,7 @@ try:
         direct_cfg["jumps"] = []
         direct = backends.create_backend("ssh", direct_cfg)
         record("E_no_jump_connects_directly",
-               [e[1] for e in events if e[0] == "connect"] == ["10.0.0.5"]
+               [e[1] for e in events if e[0] == "connect"] == ["192.0.2.5"]
                and not [e for e in events if e[0] == "channel"]
                and direct._jump_clients == [],
                {"events": events})

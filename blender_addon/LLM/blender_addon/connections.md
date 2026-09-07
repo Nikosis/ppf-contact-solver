@@ -110,7 +110,7 @@ Windows Native spawns `ppf-cts-server.exe` as a child process instead of writing
 
 Before **Start Server** on Docker-over-SSH, the add-on checks that the configured server port is published on the container. If it is not, the operator aborts with:
 
-> Docker port 9090 is not exposed on container 'ppf-dev'. Please expose the port with '-p 9090:9090' when starting the container.
+> Docker port 9090 is not exposed on container 'ppf-contact-solver'. Please expose the port with '-p 9090:9090' when starting the container.
 
 The add-on cannot publish a port on an existing container; this has to be fixed on the container side (for example by re-running `docker run -p` or editing `compose.yaml`).
 
@@ -351,8 +351,8 @@ Figure: Two stacked block diagrams showing the Docker local topology (add-on, da
 ### Setup - local Docker
 
 1. Set **Server Type** to `Docker`.
-2. Fill **Container** with the container name (default `ppf-dev`).
-3. Fill **Container Path** with the working directory inside the container, for example `/root/ppf-contact-solver` (containing the built `ppf-cts-server` binary).
+2. Leave **Container** at its default, `ppf-contact-solver`, which is the name the `docker run --name` in the project README creates. Change it only if your container carries another name.
+3. Leave **Container Path** at its default, `/root/ppf-contact-solver`, which is where the published image puts the built `ppf-cts-server`. Change it only if the solver lives elsewhere inside the container.
 4. Set **Server Port** to the TCP port `ppf-cts-server` listens on inside the container.
 5. Click **Connect**. If the container exists but is stopped, the add-on starts it for you. A missing container is reported as an error.
 
@@ -362,8 +362,8 @@ Figure: Backend Communicator with **Server Type** set to `Docker`. **Container**
 
 | Field | Description |
 | ----- | ----------- |
-| Container | Docker container name. Must already exist. |
-| Container Path | Working directory inside the container (contains the built `ppf-cts-server` binary). |
+| Container | Docker container name. Must already exist. Defaults to `ppf-contact-solver`, the name the README `docker run` creates. |
+| Container Path | Working directory inside the container (contains the built `ppf-cts-server` binary). Defaults to `/root/ppf-contact-solver`, where the published image puts it. |
 | GPU | Which CUDA device the solver runs on, as the CONTAINER sees them. A container started without `--gpus all` sees a subset of its host's cards, and the list is read inside it. See Choosing a GPU. |
 | Server Port | Port inside the container where `ppf-cts-server` listens. |
 
@@ -373,7 +373,7 @@ The SSH fields from the SSH page are combined with the Docker fields: the add-on
 
 1. Set **Server Type** to `Docker over SSH`.
 2. Fill Host / Port / Username / Key Path as in SSH Custom mode.
-3. Fill Container and Container Path.
+3. Check Container and Container Path. They carry the same defaults as local Docker, so a container created by the README `docker run` needs neither changed.
 4. Click **Connect**. The add-on verifies that the container exists on the remote host and starts it if it is stopped.
 
 WARNING: The server port must be published on the container (`-p 9090:9090` or equivalent in your compose file). Before **Start Server**, the add-on checks the port mapping on the remote host and refuses to continue if the port is not exposed, the error text tells you exactly which port and container failed. You must fix this on the container side; the add-on cannot publish ports on a container that is already created.
@@ -415,7 +415,7 @@ docker port <container> <port>
 
 on the Docker-serving host. An empty result aborts with:
 
-> Docker port 9090 is not exposed on container 'ppf-dev'. Please expose the port with '-p 9090:9090' when starting the container.
+> Docker port 9090 is not exposed on container 'ppf-contact-solver'. Please expose the port with '-p 9090:9090' when starting the container.
 
 Fix this on the container side by re-running `docker run -p 9090:9090` (or editing your `compose.yaml`); the add-on cannot publish ports on an existing container.
 
@@ -575,7 +575,7 @@ docker_port = 9090
 
 [LocalDocker]
 type = "Docker"
-container = "ppf-dev"
+container = "ppf-contact-solver"
 docker_path = "/root/ppf-contact-solver"
 docker_port = 9090
 
@@ -600,7 +600,7 @@ host = "gpu01.example.com"
 port = 22
 username = "alice"
 key_path = "~/.ssh/id_ed25519"
-container = "ppf-dev"
+container = "ppf-contact-solver"
 docker_path = "/root/ppf-contact-solver"
 docker_port = 9090
 

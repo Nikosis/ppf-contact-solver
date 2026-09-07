@@ -217,10 +217,12 @@ impl ParamManager {
                         // Int-typed keys (frames, min-newton-steps, etc.) can
                         // be seeded into the dyn list (the first entry is the
                         // current value), so emit them as floats to match the
-                        // toml path and the solver's f64 dyn_param reader. Note
-                        // the solver's apply_dyn_param has no arm for int keys,
-                        // so a dynamic int override exports but is not honored
-                        // at runtime; this arm only unblocks the export.
+                        // toml path and the solver's f64 dyn_param reader. No
+                        // int key has a runtime arm, and the solver now refuses
+                        // such a schedule by name at load rather than running
+                        // past it, so exporting one produces a loud failure
+                        // there instead of a parameter that quietly never
+                        // changes. This arm only decides the on-disk spelling.
                         let _ = writeln!(
                             &mut out,
                             "{} {}",

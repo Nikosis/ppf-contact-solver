@@ -17,6 +17,48 @@
 # behavior fix must not be served by a stale binary.
 #
 # Changelog:
+#   0.20: spatial material maps gain a time axis, a tetrahedral path, and one
+#         unit conversion shared with the values they blend against. A map row
+#         in "material-maps" carries either "weights" ({object UUID: [w per
+#         vertex]}) as before, or "times" plus "weight_frames" ({object UUID:
+#         [[w per vertex] per time]}) when the map is keyed over frames; never
+#         both. The row's own source is the map at simulated time zero and its
+#         samples name later sources, with the weights between two consecutive
+#         samples their linear interpolation, so a constant hold is two samples
+#         naming one source. A keyed map is resolved per element by the
+#         frontend and rides the existing per-triangle keyframe table, so the
+#         solver reads the same n_samples x n_element arrays it already reads.
+#         A SOLID's painted weights are authored on its Blender mesh and are
+#         carried onto its tetrahedra by a convex closest-triangle transfer
+#         plus a Dirichlet Laplace extension into the interior, which an older
+#         frontend refused on a vertex count. The map TARGET, the animated
+#         sample and the static value now go through one conversion, so a
+#         "young-mod" target ships density-normalized where it previously
+#         shipped raw pascals, and a target on a parameter whose feature toggle
+#         is off is refused rather than reintroducing the parameter. Weights
+#         are resolved by object UUID rather than by name, an attribute source
+#         is read off the EVALUATED mesh so a Geometry Nodes output reaches it,
+#         a non-finite weight is refused, and a keyframe on a ROD group's
+#         material slider is refused because no per-frame table is written for
+#         rods.
+#   0.19: Lock Translation and Lock Rotation each gain an all-axes mode
+#         (issue #139). The parameter payload adds two booleans keyed by
+#         object UUID, "lock-all-translations" and "lock-all-rotations",
+#         emitted for every object whose matching lock is enabled. True
+#         pins the center of mass to its initial POINT (three rows) or
+#         forbids net rotation about every axis (three rows); false is the
+#         line lock of 0.14 and the per-axis rotation modes of 0.15 / 0.16.
+#         An all-axes object names no axis, so it is omitted from
+#         "lock-translation" / "lock-rotation" and, for rotation, from
+#         "lock-rotation-prohibit-axis" as well: each lock state has exactly
+#         one spelling on the wire. Scene export adds the matching optional
+#         translation_lock_mode.bin table, one uint32 per displacement group
+#         aligned with translation_lock.bin (0 for a disabled or line-locked
+#         row, 1 for an all-axes row), and rotation_lock_mode.bin gains the
+#         value 2 for an all-axes rotation row. Both mode tables are omitted
+#         when no object enables the matching lock, as their axis tables are.
+#         The mode, not the axis, carries the enable bit: an all-axes record
+#         ships an exactly zero axis and scene build asserts that.
 #   0.18: structured crash reporting. The status response gains `crash_kind`, a
 #         stable snake_case tag naming the crash cause (the CrashKind the solver
 #         or the supervisor determined), alongside the existing free-form
@@ -124,4 +166,4 @@
 #         on shutdown(SHUT_WR) as the end-of-input signal. Windows tokio did not
 #         deliver that half-close to the server's AsyncRead, so the server hung
 #         in its read loop and connections piled up in FIN_WAIT_2.
-protocol = "0.18"
+protocol = "0.20"

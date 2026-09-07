@@ -17,51 +17,108 @@
 
 // Exact aggregate translation and rotation constraints.
 //
-// A deformable lock has up to four rows C: two mass-weighted center-of-mass
-// translation rows and one or two best-fit angular rows. They share one
-// Euclidean projector,
+// A deformable lock has up to six rows C: two or three mass-weighted
+// center-of-mass translation rows and one, two or three best-fit angular rows.
+// They share one Euclidean projector,
 //
 //   Q = I - C^T (C C^T)^+ C,
 //
-// rather than composing translation and rotation projectors. The pseudoinverse
-// handles a compatible partially prescribed group whose free rows are
-// rank-deficient, while an incompatible affine right-hand side fails loudly.
+// rather than composing translation and rotation projectors. Two projectors in
+// sequence do not commute, so the second would reintroduce a component the
+// first removed. The pseudoinverse handles a compatible partially prescribed
+// group whose free rows are rank-deficient, while an incompatible affine
+// right-hand side fails loudly.
+//
+// The translation rows are m_i b_k for a basis b. TRANSLATION_LOCK_AXIS uses
+// the two directions perpendicular to the requested axis, so the center of
+// mass keeps its freedom ALONG that axis and is confined to a line.
+// TRANSLATION_LOCK_ALL uses the identity basis e_x, e_y, e_z, so all three
+// components are held and the center of mass is confined to a point.
 //
 // The rotation rows use the current geometry. Allow-only uses a tangent basis
-// b perpendicular to the requested axis a. Prohibit-axis uses b = a.
+// b perpendicular to the requested axis a, prohibit-axis uses b = a, and
+// ROTATION_LOCK_ALL uses the identity basis e_x, e_y, e_z. In every case
 //
 //   b^T I^-1 sum_i m_i (r_i x dx_i)
 //       = sum_i [m_i ((I^-1 b) x r_i)]^T dx_i.
+//
+// The all-axes case therefore asserts I^-1 L = 0 for the aggregate angular
+// quantity L, which is L = 0 because I^-1 is nonsingular by construction
+// (invert_inertia_host fatals below its float32 rank floor). Taking the
+// all-axes rows through the same I^-1 form as the per-axis rows, rather than
+// the cheaper m_i (e_k x r_i), spans the same row space and so gives the same
+// Q, while keeping ONE formula in the device path and keeping check_tangent's
+// host verification a copy of it rather than a paraphrase.
 //
 // All r_i are formed by subtracting a shared anchor before accumulation.
 namespace translation_lock {
 
 constexpr unsigned UNSET = 0xffffffffu;
+
+// The widest constraint set: three translation rows plus three angular rows.
+constexpr unsigned MAX_ROWS = 6u;
+// How many of those rows belong to each half, and where the rotation block
+// starts. `check_tangent` shifts `row_mask` down by this to read the rotation
+// rows as a contiguous mask.
+constexpr unsigned TRANSLATION_ROW_COUNT = 3u;
+constexpr unsigned ROTATION_ROW_BASE = TRANSLATION_ROW_COUNT;
+constexpr unsigned ROTATION_ROW_COUNT = 3u;
+
+// BIT INDEX EQUALS ROW INDEX in RowCoefficients::row[], and row_coefficients,
+// rows_times_vector, rows_transpose_times, the Gram outer product and
+// check_tangent all rely on it. The translation and rotation blocks are
+// contiguous for the same reason, matching the PDRD reduced layout (the
+// translation block at offset 0, the rotation block at offset 3).
 constexpr unsigned TRANSLATION_ROW0 = 1u << 0;
 constexpr unsigned TRANSLATION_ROW1 = 1u << 1;
-constexpr unsigned ROTATION_ROW0 = 1u << 2;
-constexpr unsigned ROTATION_ROW1 = 1u << 3;
+constexpr unsigned TRANSLATION_ROW2 = 1u << 2;
+constexpr unsigned ROTATION_ROW0 = 1u << (ROTATION_ROW_BASE + 0);
+constexpr unsigned ROTATION_ROW1 = 1u << (ROTATION_ROW_BASE + 1);
+constexpr unsigned ROTATION_ROW2 = 1u << (ROTATION_ROW_BASE + 2);
+constexpr unsigned ROTATION_ROW_MASK =
+    ROTATION_ROW0 | ROTATION_ROW1 | ROTATION_ROW2;
 
 struct LockFrame {
     Vec3f translation_basis0;
     Vec3f translation_basis1;
+    Vec3f translation_basis2;
     Vec3f rotation_basis0;
     Vec3f rotation_basis1;
+    Vec3f rotation_basis2;
     Vec3f com_relative;
     Mat3x3f inv_inertia;
-    Mat4x4f gram_pinv;
-    Vec4f rhs;
-    Vec4f fixed;
+    Mat6x6f gram_pinv;
+    Vec6f rhs;
+    Vec6f fixed;
     unsigned row_mask;
 };
 
-__host__ __device__ inline bool axis_enabled(const Vec3f &axis) {
-    return axis[0] != 0.0f || axis[1] != 0.0f || axis[2] != 0.0f;
+// Enablement is asked through translation_lock_enabled() /
+// rotation_lock_enabled() in data.hpp, which read the MODE. There is
+// deliberately no `axis_enabled` helper here: an all-axes lock carries a zero
+// axis by contract, so an axis test would report it disabled while the UI
+// still showed it as set, and nothing downstream would produce a wrong number
+// to notice.
+
+// The part of a center-of-mass displacement the translation lock forbids. An
+// axis mode leaves the component ALONG its axis free, so only the
+// perpendicular part is constrained; an all-axes mode constrains the whole
+// vector. Both the drift accumulation and the end-of-step invariant read the
+// displacement through this, so the two cannot disagree about what is locked.
+__host__ __device__ inline Vec3f
+constrained_translation(const TranslationLock &lock, const Vec3f &delta) {
+    return lock.translation_mode == TRANSLATION_LOCK_ALL
+               ? delta
+               : perpendicular(delta, lock.axis);
+}
+
+__host__ __device__ inline bool translation_mode_valid(unsigned mode) {
+    return mode == TRANSLATION_LOCK_AXIS || mode == TRANSLATION_LOCK_ALL;
 }
 
 __host__ __device__ inline bool rotation_mode_valid(unsigned mode) {
     return mode == ROTATION_LOCK_ALLOW_ONLY ||
-           mode == ROTATION_LOCK_PROHIBIT_AXIS;
+           mode == ROTATION_LOCK_PROHIBIT_AXIS || mode == ROTATION_LOCK_ALL;
 }
 
 // A deterministic orthonormal tangent basis for a normalized axis.
@@ -83,12 +140,16 @@ __device__ inline void atomic_add_vec3(Vec3f *dst, unsigned index,
     atomicAdd(&dst[index][2], v[2]);
 }
 
-__device__ inline void atomic_add_vec4(Vec4f *dst, unsigned index,
-                                       const Vec4f &v) {
-    atomicAdd(&dst[index][0], v[0]);
-    atomicAdd(&dst[index][1], v[1]);
-    atomicAdd(&dst[index][2], v[2]);
-    atomicAdd(&dst[index][3], v[3]);
+__device__ inline void atomic_add_vec6(Vec6f *dst, unsigned index,
+                                       const Vec6f &v) {
+    // Loop rather than one line per component: this accumulates a whole
+    // constraint-space vector, so a hand-written component list silently
+    // drops whichever rows it does not mention, and a dropped row is an
+    // unconstrained direction that nothing downstream reports.
+#pragma unroll
+    for (unsigned row = 0; row < MAX_ROWS; ++row) {
+        atomicAdd(&dst[index][row], v[row]);
+    }
 }
 
 __device__ inline Vec3f matvec3(const Mat3x3f &m, const Vec3f &v) {
@@ -103,77 +164,84 @@ __host__ inline Vec3f host_matvec3(const Mat3x3f &m, const Vec3f &v) {
                  m(2, 0) * v[0] + m(2, 1) * v[1] + m(2, 2) * v[2]);
 }
 
-__device__ inline Vec4f matvec4(const Mat4x4f &m, const Vec4f &v) {
-    Vec4f out = Vec4f::Zero();
+__device__ inline Vec6f matvec6(const Mat6x6f &m, const Vec6f &v) {
+    Vec6f out = Vec6f::Zero();
 #pragma unroll
-    for (unsigned row = 0; row < 4; ++row) {
+    for (unsigned row = 0; row < MAX_ROWS; ++row) {
 #pragma unroll
-        for (unsigned col = 0; col < 4; ++col) {
+        for (unsigned col = 0; col < MAX_ROWS; ++col) {
             out[row] += m(row, col) * v[col];
         }
     }
     return out;
 }
 
-__host__ inline Vec4f host_matvec4(const Mat4x4f &m, const Vec4f &v) {
-    Vec4f out = Vec4f::Zero();
-    for (unsigned row = 0; row < 4; ++row)
-        for (unsigned col = 0; col < 4; ++col)
+__host__ inline Vec6f host_matvec6(const Mat6x6f &m, const Vec6f &v) {
+    Vec6f out = Vec6f::Zero();
+    for (unsigned row = 0; row < MAX_ROWS; ++row)
+        for (unsigned col = 0; col < MAX_ROWS; ++col)
             out[row] += m(row, col) * v[col];
     return out;
 }
 
-// Scalar coefficients of the up-to-four aggregate rows for one vertex. A
+// Scalar coefficients of the up-to-six aggregate rows for one vertex. A
 // separate Vec3f is returned for each row because each row acts on a vertex's
 // xyz block.
 struct RowCoefficients {
-    Vec3f row[4];
+    Vec3f row[MAX_ROWS];
 };
 
 __device__ inline RowCoefficients
 row_coefficients(const TranslationLock &lock, const LockFrame &frame,
                  const Vec3f &position, float mass) {
     RowCoefficients out{};
-    out.row[0] = Vec3f::Zero();
-    out.row[1] = Vec3f::Zero();
-    out.row[2] = Vec3f::Zero();
-    out.row[3] = Vec3f::Zero();
+#pragma unroll
+    for (unsigned row = 0; row < MAX_ROWS; ++row) {
+        out.row[row] = Vec3f::Zero();
+    }
     if (frame.row_mask & TRANSLATION_ROW0) {
         out.row[0] = mass * frame.translation_basis0;
     }
     if (frame.row_mask & TRANSLATION_ROW1) {
         out.row[1] = mass * frame.translation_basis1;
     }
-    if (frame.row_mask & (ROTATION_ROW0 | ROTATION_ROW1)) {
+    if (frame.row_mask & TRANSLATION_ROW2) {
+        out.row[2] = mass * frame.translation_basis2;
+    }
+    if (frame.row_mask & ROTATION_ROW_MASK) {
         const Vec3f r =
             (position - lock.anchor).cast<float>() - frame.com_relative;
         if (frame.row_mask & ROTATION_ROW0) {
             const Vec3f u = matvec3(frame.inv_inertia, frame.rotation_basis0);
-            out.row[2] = mass * u.cross(r);
+            out.row[ROTATION_ROW_BASE + 0] = mass * u.cross(r);
         }
         if (frame.row_mask & ROTATION_ROW1) {
             const Vec3f u = matvec3(frame.inv_inertia, frame.rotation_basis1);
-            out.row[3] = mass * u.cross(r);
+            out.row[ROTATION_ROW_BASE + 1] = mass * u.cross(r);
+        }
+        if (frame.row_mask & ROTATION_ROW2) {
+            const Vec3f u = matvec3(frame.inv_inertia, frame.rotation_basis2);
+            out.row[ROTATION_ROW_BASE + 2] = mass * u.cross(r);
         }
     }
     return out;
 }
 
 __device__ inline Vec3f rows_transpose_times(const RowCoefficients &c,
-                                              const Vec4f &lambda) {
+                                              const Vec6f &lambda) {
     Vec3f out = Vec3f::Zero();
 #pragma unroll
-    for (unsigned row = 0; row < 4; ++row) {
+    for (unsigned row = 0; row < MAX_ROWS; ++row) {
         out += lambda[row] * c.row[row];
     }
     return out;
 }
 
-__device__ inline Vec4f rows_times_vector(const RowCoefficients &c,
+__device__ inline Vec6f rows_times_vector(const RowCoefficients &c,
                                            const Vec3f &v) {
-    Vec4f out = Vec4f::Zero();
+    Vec6f out = Vec6f::Zero();
 #pragma unroll
-    for (unsigned row = 0; row < 4; ++row) {
+    for (unsigned row = 0; row < MAX_ROWS; ++row) {
         out[row] = c.row[row].dot(v);
     }
     return out;
@@ -267,18 +335,18 @@ inline Mat3x3f invert_inertia_host(const Mat3x3f &input,
     return inverse;
 }
 
-// Host-only Jacobi pseudoinverse of a 4x4 symmetric positive-semidefinite
+// Host-only Jacobi pseudoinverse of a 6x6 symmetric positive-semidefinite
 // Gram matrix. It returns the exact orthogonal projector for the resolved row
 // rank, including the compatible all-pinned case (rank zero).
-inline Mat4x4f pseudoinverse_gram_host(const Mat4x4f &input) {
-    double raw[4][4];
-    double a[4][4];
-    double v[4][4] = {};
-    double row_scale[4] = {};
+inline Mat6x6f pseudoinverse_gram_host(const Mat6x6f &input) {
+    double raw[MAX_ROWS][MAX_ROWS];
+    double a[MAX_ROWS][MAX_ROWS];
+    double v[MAX_ROWS][MAX_ROWS] = {};
+    double row_scale[MAX_ROWS] = {};
     double scale = 0.0;
-    for (unsigned i = 0; i < 4; ++i) {
+    for (unsigned i = 0; i < MAX_ROWS; ++i) {
         v[i][i] = 1.0;
-        for (unsigned j = 0; j < 4; ++j) {
+        for (unsigned j = 0; j < MAX_ROWS; ++j) {
             const double value =
                 0.5 * (static_cast<double>(input(i, j)) +
                        static_cast<double>(input(j, i)));
@@ -297,22 +365,28 @@ inline Mat4x4f pseudoinverse_gram_host(const Mat4x4f &input) {
     // uses a different dimensional scale. If D = diag(row_scale), solve the
     // eigensystem of D G D, then map its pseudoinverse back as
     // G^+ = D (D G D)^+ D.
-    for (unsigned i = 0; i < 4; ++i) {
-        for (unsigned j = 0; j < 4; ++j) {
+    for (unsigned i = 0; i < MAX_ROWS; ++i) {
+        for (unsigned j = 0; j < MAX_ROWS; ++j) {
             a[i][j] = row_scale[i] * raw[i][j] * row_scale[j];
             scale = std::fmax(scale, std::fabs(a[i][j]));
         }
     }
     if (scale == 0.0) {
-        return Mat4x4f::Zero();
+        return Mat6x6f::Zero();
     }
 
     const double off_floor = 1.0e-14 * scale;
-    for (unsigned sweep = 0; sweep < 32; ++sweep) {
+    // One Jacobi rotation per iteration, always on the largest remaining
+    // off-diagonal. A 6x6 has fifteen off-diagonal pairs, so this budget is
+    // eight full cycles. `converged` is checked below rather than assumed:
+    // exhausting the budget would otherwise return a partially diagonalized
+    // matrix as though it were an eigendecomposition.
+    bool converged = false;
+    for (unsigned sweep = 0; sweep < 120; ++sweep) {
         unsigned p = 0, q = 1;
         double largest = 0.0;
-        for (unsigned i = 0; i < 4; ++i) {
-            for (unsigned j = i + 1; j < 4; ++j) {
+        for (unsigned i = 0; i < MAX_ROWS; ++i) {
+            for (unsigned j = i + 1; j < MAX_ROWS; ++j) {
                 const double value = std::fabs(a[i][j]);
                 if (value > largest) {
                     largest = value;
@@ -322,6 +396,7 @@ inline Mat4x4f pseudoinverse_gram_host(const Mat4x4f &input) {
             }
         }
         if (largest <= off_floor) {
+            converged = true;
             break;
         }
         const double app = a[p][p], aqq = a[q][q], apq = a[p][q];
@@ -330,7 +405,7 @@ inline Mat4x4f pseudoinverse_gram_host(const Mat4x4f &input) {
                          (std::fabs(tau) + std::sqrt(1.0 + tau * tau));
         const double c = 1.0 / std::sqrt(1.0 + t * t);
         const double s = t * c;
-        for (unsigned k = 0; k < 4; ++k) {
+        for (unsigned k = 0; k < MAX_ROWS; ++k) {
             if (k == p || k == q) {
                 continue;
             }
@@ -341,15 +416,20 @@ inline Mat4x4f pseudoinverse_gram_host(const Mat4x4f &input) {
         a[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
         a[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
         a[p][q] = a[q][p] = 0.0;
-        for (unsigned k = 0; k < 4; ++k) {
+        for (unsigned k = 0; k < MAX_ROWS; ++k) {
             const double vkp = v[k][p], vkq = v[k][q];
             v[k][p] = c * vkp - s * vkq;
             v[k][q] = s * vkp + c * vkq;
         }
     }
 
+    if (!converged) {
+        ppf_fatal(PPF_FATAL_SOLVER_INVARIANT,
+                  "PPF FATAL: aggregate lock Gram eigensolve did not converge "
+                  "within its Jacobi budget.\n");
+    }
     double largest = 0.0;
-    for (unsigned i = 0; i < 4; ++i) {
+    for (unsigned i = 0; i < MAX_ROWS; ++i) {
         if (!std::isfinite(a[i][i])) {
             ppf_fatal(PPF_FATAL_SOLVER_INVARIANT,
                       "PPF FATAL: aggregate lock Gram eigensolve failed.\n");
@@ -357,14 +437,14 @@ inline Mat4x4f pseudoinverse_gram_host(const Mat4x4f &input) {
         largest = std::fmax(largest, std::fabs(a[i][i]));
     }
     const double rank_floor = 256.0 * 1.1920928955078125e-7 * largest;
-    Mat4x4f inverse = Mat4x4f::Zero();
-    for (unsigned k = 0; k < 4; ++k) {
+    Mat6x6f inverse = Mat6x6f::Zero();
+    for (unsigned k = 0; k < MAX_ROWS; ++k) {
         if (!(a[k][k] > rank_floor)) {
             continue;
         }
         const double inv = 1.0 / a[k][k];
-        for (unsigned i = 0; i < 4; ++i) {
-            for (unsigned j = 0; j < 4; ++j) {
+        for (unsigned i = 0; i < MAX_ROWS; ++i) {
+            for (unsigned j = 0; j < MAX_ROWS; ++j) {
                 inverse(i, j) +=
                     static_cast<float>(
                         row_scale[i] * v[i][k] * inv * v[j][k] *
@@ -378,8 +458,8 @@ inline Mat4x4f pseudoinverse_gram_host(const Mat4x4f &input) {
 class FullProjector {
   public:
     FullProjector(const DataSet &data, const Vec<unsigned> &dof_mask,
-                  Vec<LockFrame> frames, Vec<Mat4x4f> gram,
-                  Vec<Vec4f> sums, Vec<Vec3f> drift, Vec<Vec3f> torque)
+                  Vec<LockFrame> frames, Vec<Mat6x6f> gram,
+                  Vec<Vec6f> sums, Vec<Vec3f> drift, Vec<Vec3f> torque)
         : data_(data), dof_mask_(dof_mask), frames_(frames), gram_(gram),
           sums_(sums), drift_(drift), torque_(torque) {}
 
@@ -431,7 +511,7 @@ class FullProjector {
             const RowCoefficients c =
                 row_coefficients(lock, frame, positions.data[i],
                                  data.prop.vertex.data[i].mass);
-            const Vec4f lambda = matvec4(frame.gram_pinv, frame.rhs);
+            const Vec6f lambda = matvec6(frame.gram_pinv, frame.rhs);
             const Vec3f value = rows_transpose_times(c, lambda);
             q.data[3 * i + 0] = value[0];
             q.data[3 * i + 1] = value[1];
@@ -445,8 +525,8 @@ class FullProjector {
         // corrections retain exact fixed rows and drive
         // C_free q_free = rhs to the same projected round-off as Q.
         for (unsigned refinement = 0; refinement < 2; ++refinement) {
-            sums_.clear(Vec4f::Zero());
-            const Vec<Vec4f> sums = sums_;
+            sums_.clear(Vec6f::Zero());
+            const Vec<Vec6f> sums = sums_;
             DISPATCH_START(q.size / 3u)
             [data, mask, positions, frames, sums,
              q] __device__(unsigned i) mutable {
@@ -463,7 +543,7 @@ class FullProjector {
                     positions.data[i], data.prop.vertex.data[i].mass);
                 const Vec3f value(q.data[3 * i + 0], q.data[3 * i + 1],
                                   q.data[3 * i + 2]);
-                atomic_add_vec4(sums.data, li,
+                atomic_add_vec6(sums.data, li,
                                 rows_times_vector(c, value));
             }
             DISPATCH_END;
@@ -482,9 +562,9 @@ class FullProjector {
                 const RowCoefficients c = row_coefficients(
                     data.translation_lock.data[li], frame,
                     positions.data[i], data.prop.vertex.data[i].mass);
-                const Vec4f residual = frame.rhs - sums.data[li];
-                const Vec4f lambda =
-                    matvec4(frame.gram_pinv, residual);
+                const Vec6f residual = frame.rhs - sums.data[li];
+                const Vec6f lambda =
+                    matvec6(frame.gram_pinv, residual);
                 const Vec3f correction =
                     rows_transpose_times(c, lambda);
                 q.data[3 * i + 0] += correction[0];
@@ -512,12 +592,12 @@ class FullProjector {
         const Vec<unsigned> mask = dof_mask_;
         const Vec<LockFrame> frames = frames_;
         const Vec<Vec3f> positions = positions_;
-        const Vec<Vec4f> sums = sums_;
+        const Vec<Vec6f> sums = sums_;
         // Repeat the constraint-space correction so the float32
         // pseudoinverse acts as an idempotent projector even when combined
         // translation and rotation rows have different scales.
         for (unsigned refinement = 0; refinement < refinements; ++refinement) {
-            sums_.clear(Vec4f::Zero());
+            sums_.clear(Vec6f::Zero());
             DISPATCH_START(v.size / 3u)
             [data, mask, positions, frames, sums,
              v] __device__(unsigned i) mutable {
@@ -536,7 +616,7 @@ class FullProjector {
                     data.prop.vertex.data[i].mass);
                 const Vec3f value(v.data[3 * i + 0], v.data[3 * i + 1],
                                   v.data[3 * i + 2]);
-                atomic_add_vec4(sums.data, li,
+                atomic_add_vec6(sums.data, li,
                                 rows_times_vector(c, value));
             }
             DISPATCH_END;
@@ -561,8 +641,8 @@ class FullProjector {
                 const RowCoefficients c = row_coefficients(
                     lock, frame, positions.data[i],
                     data.prop.vertex.data[i].mass);
-                const Vec4f lambda =
-                    matvec4(frame.gram_pinv, sums.data[li]);
+                const Vec6f lambda =
+                    matvec6(frame.gram_pinv, sums.data[li]);
                 const Vec3f correction =
                     rows_transpose_times(c, lambda);
                 v.data[3 * i + 0] -= correction[0];
@@ -601,8 +681,7 @@ class FullProjector {
                 return;
             }
             const TranslationLock &lock = data.translation_lock.data[li];
-            if (lock.pdrd_body_index != 0 ||
-                !axis_enabled(lock.rotation_axis)) {
+            if (lock.pdrd_body_index != 0 || !rotation_lock_enabled(lock)) {
                 return;
             }
             const LockFrame &frame = frames.data[li];
@@ -631,16 +710,22 @@ class FullProjector {
         constexpr float eps = 1.19209290e-7f;
         for (unsigned li = 0; li < nl; ++li) {
             const TranslationLock &lock = locks[li];
-            if (lock.pdrd_body_index != 0 ||
-                !axis_enabled(lock.rotation_axis)) {
+            if (lock.pdrd_body_index != 0 || !rotation_lock_enabled(lock)) {
                 continue;
             }
             const Vec3f omega =
                 host_matvec3(frames_host[li].inv_inertia, torque_host[li]);
+            // The angular component the mode forbids. All-axes forbids the
+            // whole increment, so it is spelled as its own branch rather than
+            // left to fall through: with a zero axis the allow-only branch
+            // would give the same number by accident, and that accident would
+            // break the moment the axis were initialized differently.
             const float magnitude =
-                lock.rotation_mode == ROTATION_LOCK_PROHIBIT_AXIS
-                    ? fabsf(lock.rotation_axis.dot(omega))
-                    : perpendicular(omega, lock.rotation_axis).norm();
+                lock.rotation_mode == ROTATION_LOCK_ALL
+                    ? omega.norm()
+                    : (lock.rotation_mode == ROTATION_LOCK_PROHIBIT_AXIS
+                           ? fabsf(lock.rotation_axis.dot(omega))
+                           : perpendicular(omega, lock.rotation_axis).norm());
             const float omega_scale = omega.norm();
             const float torque_scale = torque_host[li].norm();
             const float inverse_scale =
@@ -669,9 +754,10 @@ class FullProjector {
                     positions.size * sizeof(VertexProp),
                     cudaMemcpyDeviceToHost));
 
-                double row_sum[2] = {0.0, 0.0};
-                double row_abs[2] = {0.0, 0.0};
-                const unsigned active_mask = frames_host[li].row_mask >> 2u;
+                double row_sum[ROTATION_ROW_COUNT] = {};
+                double row_abs[ROTATION_ROW_COUNT] = {};
+                const unsigned active_mask =
+                    frames_host[li].row_mask >> ROTATION_ROW_BASE;
                 unsigned contribution_count = 0;
                 for (unsigned i = 0; i < positions.size; ++i) {
                     if (lock_index_host[i] != li) {
@@ -686,10 +772,14 @@ class FullProjector {
                     const Vec3f u1 = host_matvec3(
                         frames_host[li].inv_inertia,
                         frames_host[li].rotation_basis1);
+                    const Vec3f u2 = host_matvec3(
+                        frames_host[li].inv_inertia,
+                        frames_host[li].rotation_basis2);
                     const float mass = vertex_prop_host[i].mass;
-                    const Vec3f coefficient[2] = {
-                        mass * u0.cross(r), mass * u1.cross(r)};
-                    for (unsigned row = 0; row < 2; ++row) {
+                    const Vec3f coefficient[ROTATION_ROW_COUNT] = {
+                        mass * u0.cross(r), mass * u1.cross(r),
+                        mass * u2.cross(r)};
+                    for (unsigned row = 0; row < ROTATION_ROW_COUNT; ++row) {
                         if (!(active_mask & (1u << row))) {
                             continue;
                         }
@@ -716,16 +806,19 @@ class FullProjector {
                 const double gamma =
                     operations * unit_roundoff /
                     (1.0 - operations * unit_roundoff);
-                const double row_bound0 = (active_mask & 1u)
-                    ? 4.0 * gamma * std::fmax(1.0, row_abs[0])
-                    : 0.0;
-                const double row_bound1 = (active_mask & 2u)
-                    ? 4.0 * gamma * std::fmax(1.0, row_abs[1])
-                    : 0.0;
-                const double verified_magnitude = std::sqrt(
-                    row_sum[0] * row_sum[0] + row_sum[1] * row_sum[1]);
-                const double verified_bound = std::sqrt(
-                    row_bound0 * row_bound0 + row_bound1 * row_bound1);
+                double magnitude_square = 0.0;
+                double bound_square = 0.0;
+                for (unsigned row = 0; row < ROTATION_ROW_COUNT; ++row) {
+                    if (!(active_mask & (1u << row))) {
+                        continue;
+                    }
+                    const double row_bound =
+                        4.0 * gamma * std::fmax(1.0, row_abs[row]);
+                    magnitude_square += row_sum[row] * row_sum[row];
+                    bound_square += row_bound * row_bound;
+                }
+                const double verified_magnitude = std::sqrt(magnitude_square);
+                const double verified_bound = std::sqrt(bound_square);
                 if (std::isfinite(verified_magnitude) &&
                     verified_magnitude <= verified_bound) {
                     continue;
@@ -751,22 +844,67 @@ class FullProjector {
                                      cudaMemcpyDeviceToHost));
         std::vector<LockFrame> host_frames(nl);
         for (unsigned li = 0; li < nl; ++li) {
+            // SMat's default constructor is empty, so `LockFrame frame{}`
+            // zeroes only `row_mask` and leaves every matrix and vector member
+            // holding stack garbage. EVERY member is therefore zeroed here,
+            // not just the ones a current reader happens to touch: that makes
+            // "a frame is fully zeroed before any conditional assignment" a
+            // property the next person to add an unconditional read can rely
+            // on, where a partial list silently stops being enough.
+            //
+            // It is not hypothetical for the basis vectors. check_tangent's
+            // host recomputation forms all three rotation coefficients before
+            // consulting the mask, so an unwritten basis puts an inf or a NaN
+            // into a quantity that is merely discarded rather than one that is
+            // never computed.
             LockFrame frame{};
+            frame.translation_basis0 = Vec3f::Zero();
+            frame.translation_basis1 = Vec3f::Zero();
+            frame.translation_basis2 = Vec3f::Zero();
+            frame.rotation_basis0 = Vec3f::Zero();
+            frame.rotation_basis1 = Vec3f::Zero();
+            frame.rotation_basis2 = Vec3f::Zero();
+            frame.com_relative = Vec3f::Zero();
+            frame.inv_inertia = Mat3x3f::Zero();
+            frame.gram_pinv = Mat6x6f::Zero();
+            frame.rhs = Vec6f::Zero();
+            frame.fixed = Vec6f::Zero();
             const TranslationLock &lock = locks[li];
+            if (!translation_mode_valid(lock.translation_mode)) {
+                ppf_fatal(PPF_FATAL_SOLVER_INVARIANT,
+                          "PPF FATAL: translation lock displacement group %u "
+                          "has invalid mode %u.\n",
+                          lock.dmap_index, lock.translation_mode);
+            }
             if (!rotation_mode_valid(lock.rotation_mode)) {
                 ppf_fatal(PPF_FATAL_SOLVER_INVARIANT,
                           "PPF FATAL: rotation lock displacement group %u has "
                           "invalid mode %u.\n",
                           lock.dmap_index, lock.rotation_mode);
             }
-            if (axis_enabled(lock.axis)) {
-                tangent_basis(lock.axis, frame.translation_basis0,
-                              frame.translation_basis1);
-                frame.row_mask |= TRANSLATION_ROW0 | TRANSLATION_ROW1;
+            if (translation_lock_enabled(lock)) {
+                if (lock.translation_mode == TRANSLATION_LOCK_ALL) {
+                    // The identity basis holds all three components, so the
+                    // center of mass is confined to a point rather than a line.
+                    frame.translation_basis0 = Vec3f(1.0f, 0.0f, 0.0f);
+                    frame.translation_basis1 = Vec3f(0.0f, 1.0f, 0.0f);
+                    frame.translation_basis2 = Vec3f(0.0f, 0.0f, 1.0f);
+                    frame.row_mask |=
+                        TRANSLATION_ROW0 | TRANSLATION_ROW1 | TRANSLATION_ROW2;
+                } else {
+                    tangent_basis(lock.axis, frame.translation_basis0,
+                                  frame.translation_basis1);
+                    frame.row_mask |= TRANSLATION_ROW0 | TRANSLATION_ROW1;
+                }
             }
-            if (lock.pdrd_body_index == 0 &&
-                axis_enabled(lock.rotation_axis)) {
-                if (lock.rotation_mode == ROTATION_LOCK_PROHIBIT_AXIS) {
+            if (lock.pdrd_body_index == 0 && rotation_lock_enabled(lock)) {
+                if (lock.rotation_mode == ROTATION_LOCK_ALL) {
+                    frame.rotation_basis0 = Vec3f(1.0f, 0.0f, 0.0f);
+                    frame.rotation_basis1 = Vec3f(0.0f, 1.0f, 0.0f);
+                    frame.rotation_basis2 = Vec3f(0.0f, 0.0f, 1.0f);
+                    frame.row_mask |=
+                        ROTATION_ROW0 | ROTATION_ROW1 | ROTATION_ROW2;
+                } else if (lock.rotation_mode == ROTATION_LOCK_PROHIBIT_AXIS) {
                     frame.rotation_basis0 = lock.rotation_axis;
                     frame.row_mask |= ROTATION_ROW0;
                 } else {
@@ -796,8 +934,7 @@ class FullProjector {
                 return;
             }
             const TranslationLock &lock = data.translation_lock.data[li];
-            if (lock.pdrd_body_index != 0 ||
-                !axis_enabled(lock.rotation_axis)) {
+            if (lock.pdrd_body_index != 0 || !rotation_lock_enabled(lock)) {
                 return;
             }
             const float mass = data.prop.vertex.data[i].mass;
@@ -808,7 +945,7 @@ class FullProjector {
         const Vec<LockFrame> frames = frames_;
         DISPATCH_START(nl)
         [data, com, frames] __device__(unsigned li) mutable {
-            if (!axis_enabled(data.translation_lock.data[li].rotation_axis)) {
+            if (!rotation_lock_enabled(data.translation_lock.data[li])) {
                 return;
             }
             frames.data[li].com_relative =
@@ -822,8 +959,7 @@ class FullProjector {
                 return;
             }
             const TranslationLock &lock = data.translation_lock.data[li];
-            if (lock.pdrd_body_index != 0 ||
-                !axis_enabled(lock.rotation_axis)) {
+            if (lock.pdrd_body_index != 0 || !rotation_lock_enabled(lock)) {
                 return;
             }
             const Vec3f r =
@@ -850,7 +986,7 @@ class FullProjector {
                                      cudaMemcpyDeviceToHost));
         for (unsigned li = 0; li < nl; ++li) {
             if (locks[li].pdrd_body_index == 0 &&
-                axis_enabled(locks[li].rotation_axis)) {
+                rotation_lock_enabled(locks[li])) {
                 host_frames[li].inv_inertia =
                     invert_inertia_host(host_inertia[li], locks[li].dmap_index);
             }
@@ -863,17 +999,17 @@ class FullProjector {
     void assemble_constraints(const Vec<Vec3f> &positions,
                               const Vec<float> &seed) {
         const unsigned nl = lock_count();
-        gram_.clear(Mat4x4f::Zero());
+        gram_.clear(Mat6x6f::Zero());
         drift_.clear(Vec3f::Zero());
         const DataSet data = data_;
         const Vec<unsigned> mask = dof_mask_;
         const Vec<LockFrame> frames = frames_;
-        const Vec<Mat4x4f> gram = gram_;
+        const Vec<Mat6x6f> gram = gram_;
         const Vec<Vec3f> drift = drift_;
         DISPATCH_START(nl)
         [frames] __device__(unsigned li) mutable {
-            frames.data[li].fixed = Vec4f::Zero();
-            frames.data[li].rhs = Vec4f::Zero();
+            frames.data[li].fixed = Vec6f::Zero();
+            frames.data[li].rhs = Vec6f::Zero();
         }
         DISPATCH_END;
         DISPATCH_START(positions.size)
@@ -886,12 +1022,12 @@ class FullProjector {
             const TranslationLock &lock = data.translation_lock.data[li];
             const LockFrame &frame = frames.data[li];
             const float mass = data.prop.vertex.data[i].mass;
-            if (axis_enabled(lock.axis)) {
+            if (translation_lock_enabled(lock)) {
                 const Vec3f delta =
                     (positions.data[i] - data.translation_lock_initial.data[i])
                         .cast<float>();
                 atomic_add_vec3(drift.data, li,
-                                mass * perpendicular(delta, lock.axis));
+                                mass * constrained_translation(lock, delta));
             }
             // PDRD aggregate DOFs are projected in the reduced six-vector.
             if (lock.pdrd_body_index != 0) {
@@ -902,13 +1038,13 @@ class FullProjector {
             if (mask.data[i] != 0u) {
                 const Vec3f p(seed.data[3 * i + 0], seed.data[3 * i + 1],
                               seed.data[3 * i + 2]);
-                atomic_add_vec4(&frames.data[li].fixed, 0u,
+                atomic_add_vec6(&frames.data[li].fixed, 0u,
                                 rows_times_vector(c, p));
                 return;
             }
-            Mat4x4f outer = Mat4x4f::Zero();
-            for (unsigned row = 0; row < 4; ++row) {
-                for (unsigned col = 0; col < 4; ++col) {
+            Mat6x6f outer = Mat6x6f::Zero();
+            for (unsigned row = 0; row < MAX_ROWS; ++row) {
+                for (unsigned col = 0; col < MAX_ROWS; ++col) {
                     outer(row, col) = c.row[row].dot(c.row[col]);
                     atomicAdd(&gram.data[li](row, col), outer(row, col));
                 }
@@ -918,7 +1054,7 @@ class FullProjector {
 
         std::vector<TranslationLock> locks(nl);
         std::vector<LockFrame> frames_host(nl);
-        std::vector<Mat4x4f> gram_host(nl);
+        std::vector<Mat6x6f> gram_host(nl);
         std::vector<Vec3f> drift_host(nl);
         CUDA_HANDLE_ERROR(cudaMemcpy(locks.data(), data_.translation_lock.data,
                                      nl * sizeof(TranslationLock),
@@ -927,7 +1063,7 @@ class FullProjector {
                                      nl * sizeof(LockFrame),
                                      cudaMemcpyDeviceToHost));
         CUDA_HANDLE_ERROR(cudaMemcpy(gram_host.data(), gram_.data,
-                                     nl * sizeof(Mat4x4f),
+                                     nl * sizeof(Mat6x6f),
                                      cudaMemcpyDeviceToHost));
         CUDA_HANDLE_ERROR(cudaMemcpy(drift_host.data(), drift_.data,
                                      nl * sizeof(Vec3f),
@@ -936,18 +1072,23 @@ class FullProjector {
         for (unsigned li = 0; li < nl; ++li) {
             LockFrame &frame = frames_host[li];
             const TranslationLock &lock = locks[li];
-            Vec4f rhs = -frame.fixed;
-            if (axis_enabled(lock.axis)) {
+            Vec6f rhs = -frame.fixed;
+            if (frame.row_mask & TRANSLATION_ROW0) {
                 rhs[0] += frame.translation_basis0.dot(drift_host[li]);
+            }
+            if (frame.row_mask & TRANSLATION_ROW1) {
                 rhs[1] += frame.translation_basis1.dot(drift_host[li]);
+            }
+            if (frame.row_mask & TRANSLATION_ROW2) {
+                rhs[2] += frame.translation_basis2.dot(drift_host[li]);
             }
             frame.rhs = rhs;
             if (lock.pdrd_body_index != 0) {
                 continue;
             }
             frame.gram_pinv = pseudoinverse_gram_host(gram_host[li]);
-            const Vec4f lambda = host_matvec4(frame.gram_pinv, rhs);
-            const Vec4f resolved = host_matvec4(gram_host[li], lambda);
+            const Vec6f lambda = host_matvec6(frame.gram_pinv, rhs);
+            const Vec6f resolved = host_matvec6(gram_host[li], lambda);
             const float residual = (rhs - resolved).norm();
             const float scale = fmaxf(1.0f, rhs.norm());
             const float bound = 4096.0f * eps * scale;
@@ -968,16 +1109,16 @@ class FullProjector {
     const DataSet &data_;
     Vec<unsigned> dof_mask_;
     Vec<LockFrame> frames_;
-    Vec<Mat4x4f> gram_;
-    mutable Vec<Vec4f> sums_;
+    Vec<Mat6x6f> gram_;
+    mutable Vec<Vec6f> sums_;
     Vec<Vec3f> drift_;
     mutable Vec<Vec3f> torque_;
     Vec<Vec3f> positions_;
 };
 
 // Verify the absolute translation invariant without modifying positions.
-// Rotation has no absolute-pose invariant; FullProjector::check_tangent verifies
-// its solved tangent direction before the line search applies it.
+// Rotation has no absolute-pose invariant; FullProjector::check_tangent verifies its solved
+// tangent direction before the line search applies it.
 inline void check_invariant(const DataSet &data, const Vec<Vec3f> &positions,
                             const char *where) {
     const unsigned nl = data.translation_lock.size;
@@ -997,7 +1138,7 @@ inline void check_invariant(const DataSet &data, const Vec<Vec3f> &positions,
             return;
         }
         const TranslationLock &lock = data.translation_lock.data[li];
-        if (!axis_enabled(lock.axis)) {
+        if (!translation_lock_enabled(lock)) {
             return;
         }
         const Vec3f delta =
@@ -1005,7 +1146,7 @@ inline void check_invariant(const DataSet &data, const Vec<Vec3f> &positions,
                 .cast<float>();
         atomic_add_vec3(sums.data, li,
                         data.prop.vertex.data[i].mass *
-                            perpendicular(delta, lock.axis));
+                            constrained_translation(lock, delta));
         atomicMax(reinterpret_cast<int *>(&max_disp.data[li]),
                   __float_as_int(fmaxf(fabsf(delta[0]),
                                        fmaxf(fabsf(delta[1]), fabsf(delta[2])))));
@@ -1021,24 +1162,20 @@ inline void check_invariant(const DataSet &data, const Vec<Vec3f> &positions,
     CUDA_HANDLE_ERROR(cudaMemcpy(locks.data(), data.translation_lock.data,
                                  nl * sizeof(TranslationLock),
                                  cudaMemcpyDeviceToHost));
-    // Absolute floor on the bound, so a group sitting near the origin is not
-    // held to a purely relative tolerance (the fp32 term below vanishes with
-    // the displacement magnitude, and a residual is never resolvable below
-    // this scale).
-    constexpr float abs_floor = 1.0f / 134217728.0f;
+    constexpr float q27 = 1.0f / 134217728.0f;
     constexpr float fp32_eps = 1.19209290e-7f;
     for (unsigned li = 0; li < nl; ++li) {
         const TranslationLock &lock = locks[li];
-        if (!axis_enabled(lock.axis)) {
+        if (!translation_lock_enabled(lock)) {
             continue;
         }
         const float residual = sums_host[li].norm() / lock.total_mass;
         const float bound =
-            8.0f * abs_floor + 256.0f * fp32_eps * fmaxf(1.0f, max_host[li]);
+            8.0f * q27 + 256.0f * fp32_eps * fmaxf(1.0f, max_host[li]);
         if (!std::isfinite(residual) || residual > bound) {
             ppf_fatal(PPF_FATAL_SOLVER_INVARIANT,
                       "PPF FATAL: translation lock group %u violated at %s: "
-                      "perpendicular COM drift %.6e exceeds the fp32 "
+                      "constrained COM drift %.6e exceeds the fp32 "
                       "round-off bound %.6e. The solver never snaps this "
                       "state; inspect the constrained Newton direction.\n",
                       lock.dmap_index, where, (double)residual, (double)bound);

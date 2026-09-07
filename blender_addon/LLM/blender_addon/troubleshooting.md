@@ -74,7 +74,7 @@ Note: the add-on accepts unknown host keys silently (paramiko `AutoAddPolicy`). 
 
 ### "Docker port N is not exposed on container '...'"
 
-- You see: e.g. `Docker port 9090 is not exposed on container 'ppf-dev'. Please expose the port with '-p 9090:9090' when starting the container.`
+- You see: e.g. `Docker port 9090 is not exposed on container 'ppf-contact-solver'. Please expose the port with '-p 9090:9090' when starting the container.`
 - Why: before **Start Server**, the add-on runs `docker port` against the container. An empty result aborts the operator.
 - Fix: re-run `docker run -p <port>:<port>` (or edit `compose.yaml` and recreate the container). The add-on cannot publish ports on an existing container.
 

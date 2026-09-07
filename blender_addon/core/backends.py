@@ -37,6 +37,7 @@ from .protocol import (
 )
 from .gpu_devices import AUTOMATIC
 from .status import BytesPerSecondCalculator
+from ..models.console import console
 from ..models.defaults import DEFAULT_SERVER_PORT, DEFAULT_SSH_KEEPALIVE_INTERVAL
 
 # The two scene payloads land at these fixed basenames under the
@@ -222,6 +223,18 @@ class ConnectionBackend(Protocol):
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+# Last query failure written to the console, so a repeating one is written
+# once rather than once per background poll. Cleared by a successful query,
+# which is what makes the same failure after a recovery a new report rather
+# than a suppressed duplicate.
+_last_query_failure = ""
+
+
+def _clear_query_failure() -> None:
+    global _last_query_failure
+    _last_query_failure = ""
+
+
 def _query_via_channel(
     channel_opener: Callable,
     args: dict,
@@ -276,8 +289,27 @@ def _query_via_channel(
         if not response_data:
             raise Exception("Empty JSON response.")
         response = json.loads(response_data.decode())
+        _clear_query_failure()
         return response, True
-    except Exception:
+    except Exception as e:
+        # The contract here is (response, alive), so the cause has nowhere to
+        # go in the return value, and the background poll stays quiet on a
+        # failed query by design: a server that has not finished booting must
+        # not trip a connection-lost reset. The console is therefore the only
+        # place the cause can be recorded, and it is what separates "not up
+        # yet" from a port nothing forwards, which are otherwise the same
+        # silence.
+        #
+        # Written only when it CHANGES. The background poll repeats for as
+        # long as the connection is held, so an unreachable server would
+        # otherwise put one identical line in the console per tick and bury
+        # everything else in it. One line per distinct cause is what a
+        # diagnosis needs, and a cause that alternates still shows both.
+        global _last_query_failure
+        cause = f"{type(e).__name__}: {e}"
+        if cause != _last_query_failure:
+            _last_query_failure = cause
+            console.write(f"Server query failed: {cause}")
         return {}, False
     finally:
         if channel:
@@ -723,15 +755,25 @@ class DockerBackend:
         if timeout is not None:
             command = f"timeout --signal=KILL {timeout:g}s {command}"
         try:
-            exit_code, stdout = self._instance.exec_run(command, workdir=cwd)
-            output = stdout.decode().strip() if exit_code == 0 else ""
-            error_output = stdout.decode().strip() if exit_code != 0 else ""
+            # ``demux=True`` keeps the container's two streams apart. Muxed
+            # together they cannot both be reported: the caller that reads
+            # stdout (the launch loop polling progress.log) would swallow a
+            # diagnostic written to stderr, and a caller that reads stderr
+            # would swallow the output it asked for. Keeping stdout on a
+            # failing command matters for the same reason: a script that
+            # printed how far it got before exiting non-zero is the only
+            # description of that failure there is, and a Start Server whose
+            # container-side script died has nothing else to show for it.
+            exit_code, streams = self._instance.exec_run(
+                command, workdir=cwd, demux=True
+            )
+            raw_out, raw_err = streams if isinstance(streams, tuple) else (streams, None)
         except Exception as e:
             return {"exit_code": 1, "stdout": [], "stderr": [str(e)]}
         return {
             "exit_code": exit_code,
-            "stdout": output.splitlines(),
-            "stderr": error_output.splitlines(),
+            "stdout": (raw_out or b"").decode(errors="replace").strip().splitlines(),
+            "stderr": (raw_err or b"").decode(errors="replace").strip().splitlines(),
         }
 
     def query(self, args: dict, project_name: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> tuple[dict, bool]:
@@ -1161,6 +1203,30 @@ def _open_jump_chain(
     return clients, sock
 
 
+def _require_published_port(instance, container: str, port: int) -> None:
+    """Raise unless *container* publishes *port* to the host.
+
+    ``NetworkSettings.Ports`` maps a container port to the host bindings
+    ``docker run -p`` created, and is empty (or maps to ``None``) for a port
+    that was never published. A container reachable through host networking
+    publishes nothing and needs nothing, so a container on that mode is
+    accepted as is rather than refused on a map it will never fill.
+    """
+    attrs = getattr(instance, "attrs", None) or {}
+    settings = attrs.get("NetworkSettings") or {}
+    if (attrs.get("HostConfig") or {}).get("NetworkMode") == "host":
+        return
+    ports = settings.get("Ports") or {}
+    if any(key.split("/")[0] == str(port) and bindings
+           for key, bindings in ports.items()):
+        return
+    raise Exception(
+        f"Container '{container}' does not publish port {port} to this "
+        f"machine, so the add-on cannot reach the solver inside it. Recreate "
+        f"it with '-p {port}:{port}'."
+    )
+
+
 def create_backend(backend_type: str, config: dict) -> ConnectionBackend:
     """Create a ConnectionBackend from a type tag and config dict.
 
@@ -1232,20 +1298,66 @@ def create_backend(backend_type: str, config: dict) -> ConnectionBackend:
             is_running_str = "\n".join(result["stdout"]).strip()
             if is_running_str != "true":
                 start_result = backend.exec_command(f"docker start {container}")
-                if not start_result:
+                # exec_command always returns a dict, so the truth of the dict
+                # says nothing about the command. The exit code is what says
+                # whether the container started.
+                if start_result["exit_code"] != 0:
+                    detail = "\n".join(start_result.get("stderr", [])).strip()
                     backend.disconnect()
-                    raise Exception(f"Error starting container '{container}'")
+                    raise Exception(
+                        f"Error starting container '{container}'"
+                        + (f": {detail}" if detail else "")
+                    )
 
         return backend
 
     elif backend_type == "docker":
         from .module import import_module
         docker = import_module("docker")
-        client = docker.from_env()
-        container_instance = client.containers.get(config["container"])
+        container = config["container"]
+        # Every failure below reaches the user as the whole text of
+        # "Connection failed: <e>", so each one has to name what is wrong and
+        # what to do about it. Left to docker-py these arrive as transport
+        # noise: a container that is not there raises
+        # ``404 Client Error for http+docker://localhost/v1.54/containers/
+        # <name>/json: Not Found ("No such container: <name>")``, and a daemon
+        # the user cannot reach raises a urllib connection error. Neither
+        # names the field to correct. The wording for a missing container is
+        # the same sentence the Docker-over-SSH path already produces, so the
+        # two Docker modes report the same condition identically.
+        try:
+            client = docker.from_env()
+        except Exception as e:
+            raise Exception(
+                f"Cannot reach the Docker daemon ({e}). Check that Docker is "
+                f"running, and on Linux that your user is in the 'docker' group."
+            ) from e
+        try:
+            container_instance = client.containers.get(container)
+        except docker.errors.NotFound as e:
+            raise Exception(
+                f"Container '{container}' does not exist. Run 'docker ps -a' "
+                f"to list the containers on this daemon, and set Container to "
+                f"the name of the one running the solver."
+            ) from e
         if container_instance.status != "running":
-            container_instance.start()
+            try:
+                container_instance.start()
+            except Exception as e:
+                raise Exception(
+                    f"Error starting container '{container}': {e}"
+                ) from e
             container_instance.reload()
+        # The add-on reaches the server through the host's loopback, so the
+        # container has to publish the port. Docker-over-SSH already asks
+        # `docker port` for this; ask the daemon here for the same answer,
+        # which docker-py has already fetched as part of the container's
+        # attributes. Without this the connection succeeds, Start Server
+        # reports the server ready inside the container, and every query then
+        # fails against a port nothing forwards, which is a much harder
+        # failure to read than a refusal naming the missing flag.
+        _require_published_port(container_instance, container,
+                                config.get("server_port", DEFAULT_SERVER_PORT))
         return DockerBackend(
             instance=container_instance,
             directory=config["path"],

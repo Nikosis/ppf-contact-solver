@@ -105,6 +105,9 @@ fn fsa_read_f64_2d_flat(
     walls,
     spheres,
     has_dyn_color,
+    vert_object_id=None,
+    vert_policy=None,
+    vert_pin_allow=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scene_fixed_scene_assemble<'py>(
@@ -125,6 +128,14 @@ pub(super) fn scene_fixed_scene_assemble<'py>(
     walls: Vec<([f64; 3], [f64; 3])>,
     spheres: Vec<([f64; 3], f64, bool, bool)>,
     has_dyn_color: bool,
+    // Intersection allowances (issue #138), all per DYNAMIC vertex. Optional
+    // and defaulted so a caller that does not use the feature is unchanged;
+    // the static collision vertices appended for the combined scan are filled
+    // in on the Rust side, which is the only place that knows how many there
+    // are.
+    vert_object_id: Option<&Bound<'py, PyAny>>,
+    vert_policy: Option<&Bound<'py, PyAny>>,
+    vert_pin_allow: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let vl_shape = vert_local.shape();
     if vl_shape.len() != 2 || vl_shape[1] != 3 {
@@ -160,6 +171,23 @@ pub(super) fn scene_fixed_scene_assemble<'py>(
         Some(arr) => Some(fsa_read_i32_2d_flat::<3>(arr, "static_tris")?),
         None => None,
     };
+    let vert_object_id_vec: Option<Vec<i32>> = match vert_object_id {
+        Some(arr) => Some(fsa_read_i32_1d(arr, "vert_object_id")?),
+        None => None,
+    };
+    let vert_policy_vec: Option<Vec<u8>> = match vert_policy {
+        Some(arr) => Some(
+            fsa_read_u32_1d(arr, "vert_policy")?
+                .into_iter()
+                .map(|v| v as u8)
+                .collect(),
+        ),
+        None => None,
+    };
+    let vert_pin_allow_vec: Option<Vec<bool>> = match vert_pin_allow {
+        Some(arr) => Some(fsa_read_bool_1d(arr, "vert_pin_allow")?),
+        None => None,
+    };
 
     let walls_rs: Vec<fsa::WallEntry> = walls
         .into_iter()
@@ -193,6 +221,9 @@ pub(super) fn scene_fixed_scene_assemble<'py>(
             walls: &walls_rs,
             spheres: &spheres_rs,
             has_dyn_color,
+            vert_object_id: vert_object_id_vec.as_deref(),
+            vert_policy: vert_policy_vec.as_deref(),
+            vert_pin_allow: vert_pin_allow_vec.as_deref(),
         })
     });
 

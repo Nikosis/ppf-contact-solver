@@ -91,11 +91,11 @@ def _has_animated_objects(context) -> bool:
     """Poll helper: True when at least one dynamic object has animation.
 
     Runs on every panel redraw. After the live server-state guards it uses
-    the fast, stateless ``scene_has_solver_cache`` scan: a ContactSolverCache
-    modifier lives only on solver-managed objects (STATIC UI move/spin/scale
-    ops produce one too), and scanning object modifiers is ~100x cheaper than
-    resolving every assigned object by UUID. Recomputed every call, so it
-    never goes stale.
+    the stateless ``scene_has_solver_cache`` scan, which reports a
+    ContactSolverCache (or an in-memory curve cache) only on objects assigned
+    to an active group -- the same objects the bake below walks, so a stray
+    modifier on an unassigned copy neither enables nor disables the button.
+    Recomputed every call, so it never goes stale.
     """
     if com.busy() or com.animation.frame:
         return False
@@ -103,7 +103,7 @@ def _has_animated_objects(context) -> bool:
     if is_running(response):
         return False
     from ...core.pc2 import scene_has_solver_cache
-    return scene_has_solver_cache()
+    return scene_has_solver_cache(context.scene)
 
 
 def _has_unfetched_frames(scene) -> bool:

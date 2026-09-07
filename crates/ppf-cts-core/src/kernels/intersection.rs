@@ -214,6 +214,87 @@ fn triangles_coplanar_overlap(
 // ---------------------------------------------------------------------------
 // Per-edge BVH traversal.
 
+// ---------------------------------------------------------------------------
+// Intersection allowances (issue #138).
+//
+// Three opt-ins let a scene start, and keep running, with intersections it
+// knows about: a per-object "allow self", a per-object "allow inter-object",
+// and a per-pin "allow the intersections of the elements I fully cover". This
+// check and the solver's own `check_intersection` must grant exactly the same
+// set, or a scene that builds here aborts there, or worse, one that is
+// tolerated there is refused here. Both therefore read the same three
+// per-VERTEX facts, and both derive an element's side of the question the same
+// way: identity and material policy from the element's FIRST vertex (a vertex
+// belongs to exactly one object, so every element built on it does too), and
+// the pinned-element bit as the AND over all of its vertices, which is what
+// "all N vertices are pinned by an allowing pin" means.
+
+/// `intersect_policy` bits. Mirrored in `ppf-cts-solver`'s `data.rs` and
+/// `cpp/data.hpp`, and in `frontend/_scene_.py`, which writes them.
+pub const INTERSECT_ALLOW_SELF: u8 = 1 << 0;
+pub const INTERSECT_ALLOW_INTER_OBJECT: u8 = 1 << 1;
+
+/// `vert_object_id` for a vertex whose source object is unknown, which is what
+/// an appended STATIC collision triangle gets. Never equal to itself, so two
+/// unknowns are not mistaken for one object.
+pub const NO_OBJECT_ID: i32 = -1;
+
+/// One element's side of the allowance question.
+struct ElementSide {
+    object_id: i32,
+    policy: u8,
+    pin_allows: bool,
+}
+
+/// Per-vertex view of the three facts, with every array optional. A caller
+/// that passes none tolerates nothing, so every intersecting pair is reported.
+pub(crate) struct VertexIntersectPolicy<'a> {
+    object_id: Option<&'a [i32]>,
+    policy: Option<&'a [u8]>,
+    pin_allows: Option<&'a [bool]>,
+}
+
+impl<'a> VertexIntersectPolicy<'a> {
+    fn is_inert(&self) -> bool {
+        self.policy.is_none() && self.pin_allows.is_none()
+    }
+
+    fn side_of(&self, element: &[i32]) -> ElementSide {
+        let first = element[0] as usize;
+        ElementSide {
+            object_id: self.object_id.map(|a| a[first]).unwrap_or(NO_OBJECT_ID),
+            policy: self.policy.map(|a| a[first]).unwrap_or(0),
+            // An element with no vertices could not be intersecting anything;
+            // `all` over an empty slice would answer true, so require one.
+            pin_allows: self
+                .pin_allows
+                .map(|a| !element.is_empty() && element.iter().all(|&v| a[v as usize]))
+                .unwrap_or(false),
+        }
+    }
+
+    /// Mirror of `ppf_isect::intersection_tolerated`, which lives in
+    /// `crates/ppf-cts-solver/src/cpp/contact/intersect_policy.hpp` and which
+    /// the device testers and the emulator both call. Keep the two in step; a
+    /// divergence is a build that passes one gate and fails the other.
+    fn tolerated(&self, a: &ElementSide, b: &ElementSide) -> bool {
+        if self.is_inert() {
+            return false;
+        }
+        // Either side is enough: a fully pinned element's shape is prescribed,
+        // so the solver was never going to resolve an intersection it is part
+        // of.
+        if a.pin_allows || b.pin_allows {
+            return true;
+        }
+        let same_object = a.object_id != NO_OBJECT_ID && a.object_id == b.object_id;
+        if same_object {
+            return a.policy & INTERSECT_ALLOW_SELF != 0;
+        }
+        (a.policy | b.policy) & INTERSECT_ALLOW_INTER_OBJECT != 0
+    }
+}
+
 #[inline]
 fn find_edge_tri_intersections(
     ei: usize,
@@ -226,6 +307,7 @@ fn find_edge_tri_intersections(
     tri_bvh: &Bvh,
     is_collider_tri: &[bool],
     tri_body_id: &[i32],
+    policy: &VertexIntersectPolicy<'_>,
 ) -> Vec<(i32, i32)> {
     let edge = [edges[2 * ei], edges[2 * ei + 1]];
     let e0 = vert3(verts, edge[0]);
@@ -274,6 +356,14 @@ fn find_edge_tri_intersections(
         0
     };
 
+    // The edge's side of the intersection allowances (issue #138). Identity
+    // and material policy come from its FIRST vertex and the pinned-element
+    // bit is the AND over both, which is what the device tester does with
+    // `EdgeProp::pin_allow_intersection`; deriving both from vertices is what
+    // keeps this check and the solver's from disagreeing, since a build that
+    // passes here must not abort there and the reverse is a silent tolerance.
+    let edge_side = policy.side_of(&edge);
+
     let mut out = Vec::new();
     traverse_overlap(tri_bvh, bb_min, bb_max, |ti| {
         if ti == parent_tri0 || ti == parent_tri1 {
@@ -296,6 +386,9 @@ fn find_edge_tri_intersections(
             tris[3 * ti as usize + 2],
         ];
         if elements_share_vertex_2_3(edge, tri) {
+            return;
+        }
+        if policy.tolerated(&edge_side, &policy.side_of(&tri)) {
             return;
         }
         if !bbox_overlap(
@@ -344,6 +437,18 @@ pub struct IntersectionInput<'a> {
     /// the device-side `same_pdrd_body` filter in contact.cu. `None`
     /// disables the rule (every triangle treated as body 0).
     pub tri_body_id: Option<&'a [i32]>,
+    /// Per-VERTEX source-object identity in the same namespace as `verts`
+    /// (`NO_OBJECT_ID` for a vertex whose object is unknown, which is what an
+    /// appended STATIC collision vertex gets). Together with `vert_policy` it
+    /// drives the self- and inter-object allowances; `None` disables both.
+    pub vert_object_id: Option<&'a [i32]>,
+    /// Per-VERTEX `INTERSECT_ALLOW_*` bits, resolved from each vertex's
+    /// object's material. `None` means no object allows anything.
+    pub vert_policy: Option<&'a [u8]>,
+    /// Per-VERTEX "pinned by a pin that allows its intersections". An element
+    /// is exempt only when every one of its vertices carries this. `None`
+    /// means no pin grants an allowance.
+    pub vert_pin_allow: Option<&'a [bool]>,
 }
 
 /// Check a triangle mesh for self-intersections, optionally including
@@ -400,6 +505,12 @@ pub fn check_self_intersection(input: IntersectionInput<'_>) -> Vec<(i32, i32)> 
         }
     };
 
+    let policy = VertexIntersectPolicy {
+        object_id: input.vert_object_id,
+        policy: input.vert_policy,
+        pin_allows: input.vert_pin_allow,
+    };
+
     // Step 5: per-edge parallel scan into (edge_idx, tri_idx) hits.
     let n_edges = all_edges.len() / 2;
     let edge_tri_pairs: Vec<(i32, i32)> = (0..n_edges)
@@ -416,6 +527,7 @@ pub fn check_self_intersection(input: IntersectionInput<'_>) -> Vec<(i32, i32)> 
                 &tri_bvh,
                 is_collider,
                 tri_body_id,
+                &policy,
             )
         })
         .collect();
@@ -472,6 +584,9 @@ mod tests {
             is_collider: None,
             rod_edges: None,
             tri_body_id: None,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert_eq!(r, vec![(0, 1)]);
     }
@@ -489,6 +604,9 @@ mod tests {
             is_collider: None,
             rod_edges: None,
             tri_body_id: None,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert_eq!(r, vec![(0, 1)]);
     }
@@ -506,6 +624,9 @@ mod tests {
             is_collider: None,
             rod_edges: None,
             tri_body_id: None,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert!(r.is_empty());
     }
@@ -523,6 +644,9 @@ mod tests {
             is_collider: None,
             rod_edges: None,
             tri_body_id: None,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert!(r.is_empty());
     }
@@ -540,6 +664,9 @@ mod tests {
             is_collider: None,
             rod_edges: None,
             tri_body_id: None,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert!(r.is_empty());
     }
@@ -558,6 +685,9 @@ mod tests {
             is_collider: Some(&coll_both),
             rod_edges: None,
             tri_body_id: None,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert!(r.is_empty(), "collider × collider must be skipped");
 
@@ -568,6 +698,9 @@ mod tests {
             is_collider: Some(&coll_one),
             rod_edges: None,
             tri_body_id: None,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert_eq!(r.len(), 1, "mixed collider/dynamic must still report");
     }
@@ -592,6 +725,9 @@ mod tests {
             is_collider: None,
             rod_edges: None,
             tri_body_id: Some(&same_body),
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert!(r.is_empty(), "same PDRD body must be skipped");
 
@@ -603,6 +739,9 @@ mod tests {
             is_collider: None,
             rod_edges: None,
             tri_body_id: Some(&diff_body),
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert_eq!(r.len(), 1, "distinct PDRD bodies must still report");
 
@@ -614,6 +753,9 @@ mod tests {
             is_collider: None,
             rod_edges: None,
             tri_body_id: Some(&one_body),
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert_eq!(r.len(), 1, "rigid body vs. non-rigid must still report");
     }
@@ -633,8 +775,151 @@ mod tests {
             is_collider: None,
             rod_edges: Some(&rod),
             tri_body_id: None,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         });
         assert_eq!(r, vec![(-1, 0)]);
+    }
+
+    // ----- Intersection allowances (issue #138) -----
+
+    /// The `crossing_triangles_detected` fixture, run with a given set of
+    /// per-vertex allowance arrays. Triangle 0 is vertices 0, 1, 2 and triangle
+    /// 1 is vertices 3, 4, 5; their interiors cross, so the answer is
+    /// `[(0, 1)]` unless an allowance covers the pair. The single pierce is
+    /// triangle 1's edge (3, 4) through triangle 0, so the two sides of the
+    /// question are that EDGE and that TRIANGLE.
+    fn check_crossing_pair(
+        vert_object_id: Option<&[i32]>,
+        vert_policy: Option<&[u8]>,
+        vert_pin_allow: Option<&[bool]>,
+    ) -> Vec<(i32, i32)> {
+        let verts = flat3(&[
+            [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [0.0, 2.0, 0.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2], [3, 4, 5]]);
+        check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: None,
+            tri_body_id: None,
+            vert_object_id,
+            vert_policy,
+            vert_pin_allow,
+        })
+    }
+
+    #[test]
+    fn allowance_control_reports_the_crossing_pair() {
+        // The control for every allowance case below. Each of those asserts
+        // that an allowance SUPPRESSES a report, which says nothing unless the
+        // same fixture with no allowance array produces one.
+        assert_eq!(check_crossing_pair(None, None, None), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn allow_self_intersection_needs_the_self_bit() {
+        // Both triangles on one object: the self allowance covers the pair.
+        let one_object = vec![7i32; 6];
+        let allow_self = vec![INTERSECT_ALLOW_SELF; 6];
+        assert!(
+            check_crossing_pair(Some(&one_object), Some(&allow_self), None).is_empty(),
+            "allow-self must cover an intersection within one object"
+        );
+
+        // The other bit is a different permission and must not stand in for it.
+        let allow_inter = vec![INTERSECT_ALLOW_INTER_OBJECT; 6];
+        assert_eq!(
+            check_crossing_pair(Some(&one_object), Some(&allow_inter), None),
+            vec![(0, 1)],
+            "allow-inter-object must not cover a same-object pair"
+        );
+    }
+
+    #[test]
+    fn allow_inter_object_intersection_from_either_side() {
+        let two_objects = vec![0i32, 0, 0, 1, 1, 1];
+
+        // Either side opting in is enough, so assert each side on its own: a
+        // rule that needed both would still pass a test that sets both.
+        let first_only = vec![
+            INTERSECT_ALLOW_INTER_OBJECT,
+            INTERSECT_ALLOW_INTER_OBJECT,
+            INTERSECT_ALLOW_INTER_OBJECT,
+            0,
+            0,
+            0,
+        ];
+        assert!(
+            check_crossing_pair(Some(&two_objects), Some(&first_only), None).is_empty(),
+            "allow-inter-object on object 0 alone must cover the pair"
+        );
+
+        let second_only = vec![
+            0,
+            0,
+            0,
+            INTERSECT_ALLOW_INTER_OBJECT,
+            INTERSECT_ALLOW_INTER_OBJECT,
+            INTERSECT_ALLOW_INTER_OBJECT,
+        ];
+        assert!(
+            check_crossing_pair(Some(&two_objects), Some(&second_only), None).is_empty(),
+            "allow-inter-object on object 1 alone must cover the pair"
+        );
+
+        // The other bit is a different permission and must not stand in for it.
+        let allow_self = vec![INTERSECT_ALLOW_SELF; 6];
+        assert_eq!(
+            check_crossing_pair(Some(&two_objects), Some(&allow_self), None),
+            vec![(0, 1)],
+            "allow-self must not cover a pair spanning two objects"
+        );
+    }
+
+    #[test]
+    fn pin_allowance_requires_every_vertex_of_an_element() {
+        // Every vertex of triangle 0 pinned by an allowing pin: that element
+        // is exempt, and one exempt side is enough for the pair.
+        let all_of_tri0 = vec![true, true, true, false, false, false];
+        assert!(
+            check_crossing_pair(None, None, Some(&all_of_tri0)).is_empty(),
+            "a fully covered element must be exempt"
+        );
+
+        // Vertex 2 dropped. Triangle 0 is then only partly covered, and the
+        // piercing edge (3, 4) carries no allowance, so the pair reports.
+        let part_of_tri0 = vec![true, true, false, false, false, false];
+        assert_eq!(
+            check_crossing_pair(None, None, Some(&part_of_tri0)),
+            vec![(0, 1)],
+            "a partially covered element must not be exempt"
+        );
+    }
+
+    #[test]
+    fn unknown_object_ids_are_not_one_object() {
+        let unknown = vec![NO_OBJECT_ID; 6];
+
+        // Identity unknown on both sides and no bit set anywhere: reported.
+        let no_bits = vec![0u8; 6];
+        assert_eq!(
+            check_crossing_pair(Some(&unknown), Some(&no_bits), None),
+            vec![(0, 1)],
+            "an unknown identity with no allowance must report"
+        );
+
+        // Two unknown identities are two different objects, not one, so the
+        // self allowance does not reach the pair.
+        let allow_self = vec![INTERSECT_ALLOW_SELF; 6];
+        assert_eq!(
+            check_crossing_pair(Some(&unknown), Some(&allow_self), None),
+            vec![(0, 1)],
+            "two unknown identities must not count as the same object"
+        );
     }
 
     // ----- Direct primitive tests -----

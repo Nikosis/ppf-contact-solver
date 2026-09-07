@@ -432,13 +432,13 @@ inline void factor(const DataSet &d, double dt) {
     s.dt = dt;
 }
 
-inline bool lock_axis_enabled(const Vec3f &axis) {
-    return axis[0] != 0.0f || axis[1] != 0.0f || axis[2] != 0.0f;
+inline bool translation_lock_mode_valid(unsigned mode) {
+    return mode == TRANSLATION_LOCK_AXIS || mode == TRANSLATION_LOCK_ALL;
 }
 
 inline bool rotation_lock_mode_valid(unsigned mode) {
     return mode == ROTATION_LOCK_ALLOW_ONLY ||
-           mode == ROTATION_LOCK_PROHIBIT_AXIS;
+           mode == ROTATION_LOCK_PROHIBIT_AXIS || mode == ROTATION_LOCK_ALL;
 }
 
 inline Eigen::Vector3d lock_axis(const Vec3f &axis, unsigned dmap_index,
@@ -459,6 +459,8 @@ inline Eigen::Vector3d lock_axis(const Vec3f &axis, unsigned dmap_index,
 struct RotationFrame {
     unsigned lock_index;
     unsigned mode;
+    // Zero under ROTATION_LOCK_ALL, which forbids every angular direction and
+    // so names none. Read `mode` to decide what the rows mean, never `axis`.
     Eigen::Vector3d axis;
     Eigen::Vector3d com;
     Eigen::Matrix3d inverse_inertia;
@@ -534,7 +536,14 @@ inline RotationFrame make_rotation_frame(const DataSet &d,
     RotationFrame frame;
     frame.lock_index = lock_index;
     frame.mode = lock.rotation_mode;
-    frame.axis = lock_axis(lock.rotation_axis, lock.dmap_index, "rotation");
+    // An all-axes lock has no direction and its record carries an exactly zero
+    // axis, which lock_axis() rejects. Skip the resolution for that mode
+    // rather than weakening lock_axis: everything above it, the center of mass
+    // and the inertia frame with its rank floor, is what the all-axes rows are
+    // built from and is needed by every mode alike.
+    frame.axis = lock.rotation_mode == ROTATION_LOCK_ALL
+        ? Eigen::Vector3d::Zero()
+        : lock_axis(lock.rotation_axis, lock.dmap_index, "rotation");
     frame.com = com;
     frame.inverse_inertia =
         eig.eigenvectors() * eig.eigenvalues().cwiseInverse().asDiagonal() *
@@ -543,12 +552,14 @@ inline RotationFrame make_rotation_frame(const DataSet &d,
 }
 
 // Build C_free and h - C_fixed p for the current local-global iteration.
-// Translation rows keep the initial perpendicular COM position. Rotation rows
-// keep the best-fit infinitesimal angular increment of this iteration on the
-// requested axis. Allow-only contributes two tangent rows, while
-// prohibit-axis contributes one row along the axis. These rows must be rebuilt
-// because their inertia frame and per-vertex coefficients depend on the
-// current iterate.
+// Translation rows keep the initial COM position: two perpendicular rows under
+// TRANSLATION_LOCK_AXIS, and one row per coordinate direction under
+// TRANSLATION_LOCK_ALL, which holds the whole point. Rotation rows keep the
+// best-fit infinitesimal angular increment of this iteration on the forbidden
+// directions: allow-only contributes two tangent rows, prohibit-axis one row
+// along the axis, and ROTATION_LOCK_ALL one row per coordinate direction.
+// These rows must be rebuilt because their inertia frame and per-vertex
+// coefficients depend on the current iterate.
 inline DynamicConstraints build_dynamic_constraints(
     const DataSet &d, const Eigen::MatrixXd &reference,
     const Eigen::MatrixXd &fixed_values, const ConstraintLayout &layout) {
@@ -571,6 +582,13 @@ inline DynamicConstraints build_dynamic_constraints(
     out.rotation_frames.reserve(d.translation_lock.size);
     for (unsigned li = 0; li < d.translation_lock.size; ++li) {
         const TranslationLock &lock = d.translation_lock.data[li];
+        if (!translation_lock_mode_valid(lock.translation_mode)) {
+            fprintf(stderr,
+                    "PPF FATAL: emulated translation lock displacement group "
+                    "%u has invalid mode %u.\n",
+                    lock.dmap_index, lock.translation_mode);
+            std::abort();
+        }
         if (!rotation_lock_mode_valid(lock.rotation_mode)) {
             fprintf(stderr,
                     "PPF FATAL: emulated rotation lock displacement group "
@@ -578,8 +596,11 @@ inline DynamicConstraints build_dynamic_constraints(
                     lock.dmap_index, lock.rotation_mode);
             std::abort();
         }
-        const bool translation_enabled = lock_axis_enabled(lock.axis);
-        const bool rotation_enabled = lock_axis_enabled(lock.rotation_axis);
+        // THE MODE CARRIES THE ENABLE BIT, NOT THE AXIS: an all-axes half is
+        // on with an exactly zero axis, so these are the shared predicates
+        // from data.hpp rather than a local axis test.
+        const bool translation_enabled = translation_lock_enabled(lock);
+        const bool rotation_enabled = rotation_lock_enabled(lock);
         if (!translation_enabled && !rotation_enabled) {
             fprintf(stderr,
                     "PPF FATAL: emulated aggregate lock displacement group "
@@ -625,18 +646,37 @@ inline DynamicConstraints build_dynamic_constraints(
         };
 
         if (translation_enabled) {
-            const Eigen::Vector3d axis =
-                lock_axis(lock.axis, lock.dmap_index, "translation");
-            Eigen::Vector3d b0, b1;
-            lock_basis(axis, b0, b1);
-            append_row(b0, nullptr);
-            append_row(b1, nullptr);
+            if (lock.translation_mode == TRANSLATION_LOCK_ALL) {
+                // Pinning the point constrains every direction, so the
+                // three coordinate directions span the row space and there is
+                // no axis to choose a basis around.
+                for (int k = 0; k < 3; ++k) {
+                    append_row(Eigen::Vector3d::Unit(k), nullptr);
+                }
+            } else {
+                const Eigen::Vector3d axis =
+                    lock_axis(lock.axis, lock.dmap_index, "translation");
+                Eigen::Vector3d b0, b1;
+                lock_basis(axis, b0, b1);
+                append_row(b0, nullptr);
+                append_row(b1, nullptr);
+            }
         }
         if (rotation_enabled) {
             out.rotation_frames.push_back(
                 make_rotation_frame(d, reference, li));
             const RotationFrame &frame = out.rotation_frames.back();
-            if (frame.mode == ROTATION_LOCK_PROHIBIT_AXIS) {
+            if (frame.mode == ROTATION_LOCK_ALL) {
+                // The coordinate directions run through the SAME inverse
+                // inertia path as an axis mode's basis vectors. Any three
+                // independent b span the same row space, so the projector is
+                // identical to the cheaper mass * (e_k x r) spelling, and
+                // keeping one formula keeps check_rotation_tangent below a
+                // copy of what is built here rather than a paraphrase of it.
+                for (int k = 0; k < 3; ++k) {
+                    append_row(Eigen::Vector3d::Unit(k), &frame);
+                }
+            } else if (frame.mode == ROTATION_LOCK_PROHIBIT_AXIS) {
                 append_row(frame.axis, &frame);
             } else {
                 Eigen::Vector3d b0, b1;
@@ -675,9 +715,19 @@ inline void check_rotation_tangent(const DataSet &d,
             torque += mass * r.cross(dx);
         }
         const Eigen::Vector3d omega = frame.inverse_inertia * torque;
-        const double forbidden = frame.mode == ROTATION_LOCK_PROHIBIT_AXIS
-            ? std::abs(frame.axis.dot(omega))
-            : (omega - frame.axis * frame.axis.dot(omega)).norm();
+        // One branch per mode, spelled out. ROTATION_LOCK_ALL forbids the
+        // whole angular increment; letting it fall through to the allow-only
+        // branch would give the same number only because its axis happens to
+        // be zero, which is an accident of the record and not the invariant
+        // being measured.
+        double forbidden = 0.0;
+        if (frame.mode == ROTATION_LOCK_ALL) {
+            forbidden = omega.norm();
+        } else if (frame.mode == ROTATION_LOCK_PROHIBIT_AXIS) {
+            forbidden = std::abs(frame.axis.dot(omega));
+        } else {
+            forbidden = (omega - frame.axis * frame.axis.dot(omega)).norm();
+        }
         const double inverse_scale =
             frame.inverse_inertia.cwiseAbs().maxCoeff();
         const double bound = 4096.0 * eps *
@@ -699,7 +749,7 @@ inline Eigen::Vector3d translation_lock_residual(const DataSet &d,
                                                  const Eigen::MatrixXd &x,
                                                  unsigned lock_index) {
     const TranslationLock &lock = d.translation_lock.data[lock_index];
-    if (!lock_axis_enabled(lock.axis)) {
+    if (!translation_lock_enabled(lock)) {
         return Eigen::Vector3d::Zero();
     }
     Eigen::Vector3d sum = Eigen::Vector3d::Zero();
@@ -712,6 +762,13 @@ inline Eigen::Vector3d translation_lock_residual(const DataSet &d,
         sum.x() += mass * (x(v, 0) - initial[0]);
         sum.y() += mass * (x(v, 1) - initial[1]);
         sum.z() += mass * (x(v, 2) - initial[2]);
+    }
+    // TRANSLATION_LOCK_ALL constrains the whole mass-weighted displacement,
+    // so the whole vector is the violation. Returning only the perpendicular
+    // component there would let an unbounded slide along any direction pass
+    // the end-of-step gate this feeds.
+    if (lock.translation_mode == TRANSLATION_LOCK_ALL) {
+        return sum;
     }
     const Eigen::Vector3d axis =
         lock_axis(lock.axis, lock.dmap_index, "translation");
@@ -1090,8 +1147,8 @@ inline bool step(DataSet &dev, const ParamSet &param) {
         if (!std::isfinite(residual) || residual > 1e-9) {
             fprintf(stderr,
                     "PPF FATAL: emulated translation lock group %u left "
-                    "perpendicular COM drift %.6e after the constrained "
-                    "global solve.\n",
+                    "locked COM drift %.6e after the constrained global "
+                    "solve.\n",
                     dev.translation_lock.data[li].dmap_index, residual);
             std::abort();
         }

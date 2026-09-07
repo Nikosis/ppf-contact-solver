@@ -72,6 +72,15 @@ pub struct AssembleInput<'a> {
     /// Optional list of pinned vertex indices. Wall and sphere checks
     /// skip these. Empty for "none".
     pub pinned_vertices: &'a [usize],
+    /// Intersection allowances (issue #138), all per DYNAMIC vertex and all
+    /// optional; `None` throughout tolerates nothing, so every intersecting
+    /// pair is reported. The combined self-intersection scan appends the STATIC
+    /// collision vertices, which get `NO_OBJECT_ID`, an empty policy and no
+    /// pin: a static is always the OTHER object, so it is the dynamic side
+    /// that decides, and "either side opts in" makes that the whole rule.
+    pub vert_object_id: Option<&'a [i32]>,
+    pub vert_policy: Option<&'a [u8]>,
+    pub vert_pin_allow: Option<&'a [bool]>,
     /// Static walls only. Kinematic walls are filtered upstream.
     pub walls: &'a [WallEntry],
     /// Static spheres only.
@@ -267,12 +276,36 @@ pub fn fixed_scene_assemble(input: AssembleInput<'_>) -> Result<AssembleOutput, 
         } else {
             None
         };
+        // Extend the three per-vertex allowance arrays over the appended
+        // STATIC vertices. The extension has to happen here rather than in
+        // the caller because only this function knows how many static
+        // vertices were concatenated, and a length mismatch would index out
+        // of the combined namespace.
+        let n_combined_verts = combined_verts.len() / 3;
+        let extend_object_id = input.vert_object_id.map(|a| {
+            let mut v = a.to_vec();
+            v.resize(n_combined_verts, isect::NO_OBJECT_ID);
+            v
+        });
+        let extend_policy = input.vert_policy.map(|a| {
+            let mut v = a.to_vec();
+            v.resize(n_combined_verts, 0);
+            v
+        });
+        let extend_pin_allow = input.vert_pin_allow.map(|a| {
+            let mut v = a.to_vec();
+            v.resize(n_combined_verts, false);
+            v
+        });
         let pairs = isect::check_self_intersection(isect::IntersectionInput {
             verts: &combined_verts,
             tris: &combined_tris,
             is_collider: Some(&combined_is_collider),
             rod_edges: rod_for_check.as_deref(),
             tri_body_id: Some(&combined_body_id),
+            vert_object_id: extend_object_id.as_deref(),
+            vert_policy: extend_policy.as_deref(),
+            vert_pin_allow: extend_pin_allow.as_deref(),
         });
         if !pairs.is_empty() {
             out.has_self_intersection = true;
@@ -574,6 +607,9 @@ mod tests {
             walls: &[],
             spheres: &[],
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         }
     }
 
@@ -614,6 +650,9 @@ mod tests {
             walls: &[],
             spheres: &[],
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         assert!(!out.has_self_intersection);
@@ -648,6 +687,9 @@ mod tests {
             walls: &[],
             spheres: &[],
             has_dyn_color: true,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         let w = out.face_to_vert_weights.as_ref().unwrap();
@@ -688,6 +730,9 @@ mod tests {
             walls: &walls,
             spheres: &[],
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         assert!(out.has_wall_violation);
@@ -728,6 +773,9 @@ mod tests {
             walls: &walls,
             spheres: &[],
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         assert!(!out.has_wall_violation);
@@ -763,6 +811,9 @@ mod tests {
             walls: &walls,
             spheres: &[],
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         assert!(out.has_wall_violation);
@@ -801,6 +852,9 @@ mod tests {
             walls: &[],
             spheres: &spheres,
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         assert!(out.has_sphere_violation);
@@ -845,6 +899,9 @@ mod tests {
             walls: &[],
             spheres: &[],
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         assert!(out.has_self_intersection);
@@ -884,6 +941,9 @@ mod tests {
             walls: &[],
             spheres: &[],
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         assert_eq!(out.area.len(), 2);
@@ -926,6 +986,9 @@ mod tests {
             walls: &walls,
             spheres: &spheres,
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         assert!(out.has_wall_violation);
@@ -961,6 +1024,9 @@ mod tests {
             walls: &[],
             spheres: &[],
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         assert!(!out.has_self_intersection);
@@ -1003,6 +1069,9 @@ mod tests {
             walls: &[],
             spheres: &[],
             has_dyn_color: false,
+            vert_object_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
         };
         let out = fixed_scene_assemble(input).unwrap();
         assert!(!out.has_self_intersection, "collider × collider must be skipped");

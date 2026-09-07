@@ -305,6 +305,10 @@ pub struct PinHeader {
     pub pull_strength: f64,
     pub unpin_time: Option<f64>,
     pub pin_group_id: Option<String>,
+    /// This pin asks for the intersections of the elements it fully covers to
+    /// be tolerated rather than reported. Emitted only when true, so a scene
+    /// that does not use the feature writes a byte-identical pin section.
+    pub allow_intersection: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -381,6 +385,9 @@ fn format_pin_section(pin_index: usize, header: &PinHeader, ops: &[PinOpToml]) -
         if !pg.is_empty() {
             let _ = writeln!(s, "pin_group_id = \"{pg}\"");
         }
+    }
+    if header.allow_intersection {
+        let _ = writeln!(s, "allow_intersection = true");
     }
     s.push('\n');
 
@@ -845,6 +852,7 @@ mod tests {
             pull_strength: 0.0,
             unpin_time: None,
             pin_group_id: None,
+            allow_intersection: false,
         };
         let ops = vec![PinOpToml::MoveBy {
             t_start: 0.0,
@@ -871,6 +879,7 @@ mod tests {
             pull_strength: 0.0,
             unpin_time: None,
             pin_group_id: None,
+            allow_intersection: false,
         };
         let ops = vec![PinOpToml::MoveBy {
             t_start: 0.0,
@@ -894,6 +903,7 @@ mod tests {
             pull_strength: 0.5,
             unpin_time: Some(2.5),
             pin_group_id: Some("g0".to_string()),
+            allow_intersection: false,
         };
         let s = format_pin_section(3, &header, &[]);
         assert!(s.contains("unpin_time = 2.5"));
@@ -908,6 +918,7 @@ mod tests {
             pull_strength: 0.0,
             unpin_time: None,
             pin_group_id: None,
+            allow_intersection: false,
         };
         let ops = vec![PinOpToml::Torque {
             axis_component: 1,

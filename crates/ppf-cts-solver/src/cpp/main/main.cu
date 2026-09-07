@@ -1291,13 +1291,30 @@ StepResult advance() {
                 : okind == 3u ? "vertex-face (collision mesh)"
                 : okind == 4u ? "face-vertex (collision mesh)"
                 : okind == 5u ? "edge-edge (collision mesh)"
+                : okind == 6u ? "contact assembly"
+                : okind == 7u ? "vertex-face (collision mesh, assembly)"
+                : okind == 8u ? "face-vertex (collision mesh, assembly)"
+                : okind == 9u ? "edge-edge (collision mesh, assembly)"
                               : "unknown";
             // A negative offset is the unset value: the flag came from a
             // collapsed sweep frame, which has no scale to report lengths in.
             // The distance and offset belong to a flagged pair, which need not
             // be the named one, since the indices are first-writer-wins and
             // these two are last-writer.
-            if (ooffset < 0.0f) {
+            if (okind >= 6u) {
+                // Reported by the ASSEMBLY, not the sweep: the pair's
+                // separation had already reached the contact offset when the
+                // barrier was evaluated, so it has no normal and contributed
+                // nothing. These lengths are world-space, not rescaled.
+                logging.message(
+                    "### contact starts overlapping: a %s pair's separation "
+                    "has already collapsed to the contact offset, so the "
+                    "barrier has no direction to act along and the pair "
+                    "carries no force. offending pair: vertices %u and %u, "
+                    "squared separation %.6e against offset %.6e, in world "
+                    "units.",
+                    okind_str, ov0, ov1, od2, ooffset);
+            } else if (ooffset < 0.0f) {
                 logging.message(
                     "### contact starts overlapping: the sweep frame of a %s "
                     "pair collapsed, so two primitives are coincident to the "
@@ -1314,10 +1331,17 @@ StepResult advance() {
                     "the CCD's rescaled units.",
                     okind_str, ov0, ov1, od2, ooffset);
             }
-            if (okind >= 3u && okind <= 5u) {
+            if ((okind >= 3u && okind <= 5u) || (okind >= 7u && okind <= 9u)) {
                 logging.message(
                     "### the second index is in the static collision-mesh "
                     "vertex space; the first is a dynamic vertex.");
+            }
+            if (okind >= 6u) {
+                logging.message(
+                    "### an intersection allowance suppresses the BUILD-TIME "
+                    "report of an overlap; it does not make one solvable, and "
+                    "contact never consults it. A scene admitted that way "
+                    "still has to start with its surfaces apart.");
             }
             logging.message("### give the initial geometry a small clearance so "
                             "nothing starts in contact, or check whether a "
@@ -1465,7 +1489,21 @@ StepResult advance() {
                     contact::ccd_overlap_info(ov0, ov1, okind, od2, ooffset);
                     // See the note at the first overlap site: a negative
                     // offset means a collapsed sweep frame, not a real offset.
-                    if (ooffset < 0.0f) {
+                    if (okind >= 6u) {
+                        // Assembly-side report (kinds 6-9): world-space
+                        // lengths, and a pair with no barrier direction at all.
+                        logging.message(
+                            "### contact starts overlapping during the "
+                            "rigidify commit: a kind %u pair's separation has "
+                            "already collapsed to the contact offset, so the "
+                            "barrier has no direction to act along (vertices "
+                            "%u and %u; squared separation %.6e against offset "
+                            "%.6e, in world units). Give the initial geometry "
+                            "a small clearance, or check a stitch/pin pulling "
+                            "elements together faster than contact can "
+                            "resolve.",
+                            okind, ov0, ov1, od2, ooffset);
+                    } else if (ooffset < 0.0f) {
                         logging.message(
                             "### contact starts overlapping during the "
                             "rigidify commit: the sweep frame of a kind %u "
@@ -2139,6 +2177,28 @@ extern "C" DLL_EXPORT void update_constraint(const Constraint *constraint) {
                            && is_fixed(h[2]) && is_fixed(h[3]);
     }
     mem::copy_to_device(hinge_prop, main_helper::dev_dataset.prop.hinge);
+}
+
+extern "C" DLL_EXPORT void update_material_params(const MaterialParamUpdate *update) {
+    // Replace the device-side face material table for this frame. The energy
+    // kernels index it through FaceProp::param_index, which the host pinned to
+    // the identity when it built an animated scene, so the table's rows line up
+    // with the faces and stay lined up however the values move. The LBVH also
+    // reads ghat and offset from here when it rebuilds each step, so an
+    // animated contact param would reach the broad phase through the same
+    // upload; no key that touches those is accepted yet.
+    if (update->face.size) {
+        mem::copy_to_device(update->face, main_helper::dev_dataset.param_arrays.face);
+    }
+    if (update->vertex.size) {
+        mem::copy_to_device(update->vertex, main_helper::dev_dataset.param_arrays.vertex);
+    }
+    if (update->edge.size) {
+        mem::copy_to_device(update->edge, main_helper::dev_dataset.param_arrays.edge);
+    }
+    if (update->hinge.size) {
+        mem::copy_to_device(update->hinge, main_helper::dev_dataset.param_arrays.hinge);
+    }
 }
 
 extern "C" DLL_EXPORT void update_rest_shape(const RestShapeUpdate *update) {

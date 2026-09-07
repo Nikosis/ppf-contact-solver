@@ -5,7 +5,8 @@
 
 use super::cvec::CVec;
 use super::data::{
-    Constraint, IntersectionRecord, Mat2x2f, Mat3x3f, RestShapeUpdate, StepResult, Vec3f,
+    Constraint, EdgeParam, FaceParam, HingeParam, IntersectionRecord, Mat2x2f, Mat3x3f,
+    MaterialParamUpdate, RestShapeUpdate, StepResult, Vec3f, VertexParam,
     MAX_INTERSECTION_RECORDS,
 };
 use super::plastic_state::{PlasticKinds, PlasticState};
@@ -35,6 +36,7 @@ extern "C" {
     fn update_dyn(index: *const u32, offset: *const u32);
     fn update_constraint(constraint: *const Constraint);
     fn update_rest_shape(update: *const RestShapeUpdate);
+    fn update_material_params(update: *const MaterialParamUpdate);
     fn initialize(data: *const DataSet, param: *const ParamSet) -> bool;
     fn override_velocity(indices: *const u32, count: u32, vx: f32, vy: f32, vz: f32, dt: f32);
     fn gather_current_positions(indices: *const u32, count: u32, out: *mut f32);
@@ -132,6 +134,139 @@ fn interp_rest_shape(keyframes: &[RestShapeKeyframe], time: f64) -> RestShapeUpd
     }
 }
 
+/// One precomputed material keyframe: `(time, face_params)`.
+///
+/// Each entry is a full face table assembled by `Scene::make_props_at` at that
+/// keyframe's time, so it went through the same assembly as the build-time
+/// table and carries the same derived quantities.
+struct MaterialKeyframe {
+    time: f64,
+    face: Vec<FaceParam>,
+    vertex: Vec<VertexParam>,
+    edge: Vec<EdgeParam>,
+    hinge: Vec<HingeParam>,
+}
+
+/// Interpolate a material keyframe schedule to `time` and pack every table for
+/// `update_material_params`. Clamps to the nearest end outside the schedule.
+///
+/// Every float field is blended, not a chosen subset. A field no animated key
+/// can reach holds the same value in both keyframes, so blending it is a
+/// no-op, and that is worth more than the saved arithmetic: a per-field
+/// allowlist has to be extended whenever a key becomes animatable, and
+/// forgetting one leaves that parameter frozen at its first keyframe with
+/// nothing to show it. `model` and the boolean flags are structural and come
+/// from the earlier keyframe.
+///
+/// Blending the DERIVED tables is exact rather than an approximation: a hinge,
+/// edge or vertex value is an area- or length-weighted average of face values,
+/// which is linear, so averaging blended faces and blending averaged hinges
+/// agree. Only the face table's own Lame conversion is nonlinear, and there
+/// the keyframes are what the artist set (see `interp_rest_shape`, which makes
+/// the same choice for assembled inverse-rest matrices).
+fn interp_material_params(
+    keyframes: &[MaterialKeyframe],
+    time: f64,
+) -> (Vec<FaceParam>, Vec<VertexParam>, Vec<EdgeParam>, Vec<HingeParam>) {
+    let n = keyframes.len();
+    let (lo, hi, alpha) = if n == 1 || time <= keyframes[0].time {
+        (0, 0, 0.0f32)
+    } else if time >= keyframes[n - 1].time {
+        (n - 1, n - 1, 0.0f32)
+    } else {
+        let hi = keyframes.partition_point(|k| k.time < time);
+        let lo = hi - 1;
+        let (t0, t1) = (keyframes[lo].time, keyframes[hi].time);
+        let a = if t1 > t0 {
+            ((time - t0) / (t1 - t0)) as f32
+        } else {
+            0.0
+        };
+        (lo, hi, a)
+    };
+    let f = |a: f32, b: f32| a + (b - a) * alpha;
+    let (ka, kb) = (&keyframes[lo], &keyframes[hi]);
+
+    let face = ka
+        .face
+        .iter()
+        .zip(kb.face.iter())
+        .map(|(a, b)| FaceParam {
+            model: a.model,
+            mu: f(a.mu, b.mu),
+            lambda: f(a.lambda, b.lambda),
+            friction: f(a.friction, b.friction),
+            ghat: f(a.ghat, b.ghat),
+            offset: f(a.offset, b.offset),
+            bend: f(a.bend, b.bend),
+            strainlimit: f(a.strainlimit, b.strainlimit),
+            shrink_x: f(a.shrink_x, b.shrink_x),
+            shrink_y: f(a.shrink_y, b.shrink_y),
+            pressure: f(a.pressure, b.pressure),
+            plasticity: f(a.plasticity, b.plasticity),
+            plasticity_threshold: f(a.plasticity_threshold, b.plasticity_threshold),
+            bend_plasticity: f(a.bend_plasticity, b.bend_plasticity),
+            bend_plasticity_threshold: f(
+                a.bend_plasticity_threshold,
+                b.bend_plasticity_threshold,
+            ),
+            bend_rest_from_geometry: a.bend_rest_from_geometry,
+            deform_damping: f(a.deform_damping, b.deform_damping),
+            bend_damping: f(a.bend_damping, b.bend_damping),
+            bend_warp: f(a.bend_warp, b.bend_warp),
+            bend_weft: f(a.bend_weft, b.bend_weft),
+        })
+        .collect();
+
+    let vertex = ka
+        .vertex
+        .iter()
+        .zip(kb.vertex.iter())
+        .map(|(a, b)| VertexParam {
+            ghat: f(a.ghat, b.ghat),
+            offset: f(a.offset, b.offset),
+            friction: f(a.friction, b.friction),
+        })
+        .collect();
+
+    let edge = ka
+        .edge
+        .iter()
+        .zip(kb.edge.iter())
+        .map(|(a, b)| EdgeParam {
+            stiffness: f(a.stiffness, b.stiffness),
+            bend: f(a.bend, b.bend),
+            ghat: f(a.ghat, b.ghat),
+            offset: f(a.offset, b.offset),
+            friction: f(a.friction, b.friction),
+            strainlimit: f(a.strainlimit, b.strainlimit),
+            plasticity: f(a.plasticity, b.plasticity),
+            plasticity_threshold: f(a.plasticity_threshold, b.plasticity_threshold),
+            bend_rest_from_geometry: a.bend_rest_from_geometry,
+            deform_damping: f(a.deform_damping, b.deform_damping),
+            bend_damping: f(a.bend_damping, b.bend_damping),
+        })
+        .collect();
+
+    let hinge = ka
+        .hinge
+        .iter()
+        .zip(kb.hinge.iter())
+        .map(|(a, b)| HingeParam {
+            bend: f(a.bend, b.bend),
+            ghat: f(a.ghat, b.ghat),
+            offset: f(a.offset, b.offset),
+            plasticity: f(a.plasticity, b.plasticity),
+            plasticity_threshold: f(a.plasticity_threshold, b.plasticity_threshold),
+            bend_damping: f(a.bend_damping, b.bend_damping),
+            bend_warp: f(a.bend_warp, b.bend_warp),
+            bend_weft: f(a.bend_weft, b.bend_weft),
+        })
+        .collect();
+
+    (face, vertex, edge, hinge)
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Backend {
     pub mesh: MeshSet,
@@ -164,6 +299,18 @@ pub struct MeshSet {
     /// colliders", the same as a scene with no STATIC collider.
     #[serde(default)]
     pub collider_vertex_mask: Vec<u8>,
+    /// Per-vertex source-object identity (length = vertex count, or empty when
+    /// the session directory carries no `object_vert.bin`). Separates a self-
+    /// intersection from an inter-object one; empty means the solver knows no
+    /// object boundaries and can grant neither allowance. `serde(default)` so
+    /// a checkpoint whose serialized form omits it deserializes as empty.
+    #[serde(default)]
+    pub object_vertex_index: Vec<u32>,
+    /// Per-vertex intersection tolerances resolved from each vertex's object's
+    /// material (`INTERSECT_ALLOW_SELF | INTERSECT_ALLOW_INTER_OBJECT`).
+    /// Empty means every object is at the default, which allows nothing.
+    #[serde(default)]
+    pub intersect_policy: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -731,6 +878,10 @@ impl Backend {
         // animated rest shapes stay identical, then interpolates between
         // keyframes per step. Empty (no per-step upload) when the scene has no
         // schedule.
+        // Assembled lazily on the first step: `self.mesh` is borrowed
+        // immutably to build it and the surrounding scope holds `&mut self`,
+        // so it is cheaper to defer than to restructure the borrow here.
+        let mut material_keyframes: Option<Vec<MaterialKeyframe>> = None;
         let rest_shape_keyframes: Vec<RestShapeKeyframe> = match scene.rest_shape_schedule() {
             Some((times, frames)) => {
                 let face_props = dataset.prop.face.as_slice();
@@ -826,6 +977,51 @@ impl Backend {
                 break;
             }
 
+            // Precompute the material keyframes on the first step. The
+            // face table is expanded to one entry per face for an animated
+            // scene, so this is the largest per-frame upload here and it is
+            // assembled once per keyframe rather than once per step.
+            if material_keyframes.is_none() {
+                material_keyframes = Some(if scene.has_material_animation() {
+                    let face_area =
+                        crate::triutils::face_areas(&self.mesh.vertex, &self.mesh.mesh.mesh.face);
+                    let tet_volumes =
+                        crate::triutils::tet_volumes(&self.mesh.vertex, &self.mesh.mesh.mesh.tet);
+                    scene
+                        .param_anim_times()
+                        .iter()
+                        .map(|&t| {
+                            let props =
+                                scene.make_props_at(t, &self.mesh, &face_area, &tet_volumes);
+                            // The hinge, edge and vertex tables are averages of
+                            // the faces, so this frame's faces imply this
+                            // frame's derived tables. Deriving them here, once
+                            // per keyframe, keeps the per-step work to a blend.
+                            let (vertex, edge, hinge) = crate::builder::rederive_animated_tables(
+                                &self.mesh,
+                                dataset.prop.face.as_slice(),
+                                &props.face_params,
+                                dataset.prop.edge.as_slice(),
+                                dataset.prop.hinge.as_slice(),
+                                dataset.prop.vertex.as_slice(),
+                                dataset.param_arrays.vertex.as_slice(),
+                                dataset.param_arrays.edge.as_slice(),
+                                &face_area,
+                            );
+                            MaterialKeyframe {
+                                time: t,
+                                face: props.face_params,
+                                vertex,
+                                edge,
+                                hinge,
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                });
+            }
+
             // Interpolate dynamic params (including a keyframed dt) for this
             // step BEFORE deriving the step's target time. update_param looks
             // up self.state.time (the step START), which is the correct sample
@@ -856,6 +1052,24 @@ impl Backend {
             if !rest_shape_keyframes.is_empty() {
                 let rest_shape = interp_rest_shape(&rest_shape_keyframes, target_time);
                 unsafe { update_rest_shape(&rest_shape) };
+            }
+
+            // Stream this step's material tables, on the same schedule and for
+            // the same reason as the rest shape: the energy kernels read the
+            // param arrays fresh each Newton iteration, so overwriting them
+            // here drives the material through the step.
+            if let Some(keyframes) = material_keyframes.as_ref() {
+                if !keyframes.is_empty() {
+                    let (face, vertex, edge, hinge) =
+                        interp_material_params(keyframes, target_time);
+                    let update = MaterialParamUpdate {
+                        face: CVec::from(&face[..]),
+                        vertex: CVec::from(&vertex[..]),
+                        edge: CVec::from(&edge[..]),
+                        hinge: CVec::from(&hinge[..]),
+                    };
+                    unsafe { update_material_params(&update) };
+                }
             }
 
             for (indices, vx, vy, vz) in scene.get_velocity_overrides(self.state.time, param.dt) {

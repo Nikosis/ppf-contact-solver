@@ -366,7 +366,19 @@ class BlenderApp:
         param_decoder = self._param_decoder
         if param_decoder is None:
             param_decoder = ParamDecoder().set_path(param_path)
-        param_decoder.apply_to_objects(self._scene, verbose=self._verbose)
+        param_decoder.apply_to_objects(
+            self._scene,
+            verbose=self._verbose,
+            solid_weight_transfers=(
+                self._scene_decoder.solid_weight_transfer
+                if self._scene_decoder is not None
+                else None
+            ),
+        )
+        # The transfers hold a SuperLU factor and a sparse system, neither of
+        # which belongs in the app-state pickle written at the end of make().
+        if self._scene_decoder is not None:
+            self._scene_decoder.release_solid_weight_transfers()
         self._report_progress(0.72, "Applying pin configuration...")
         param_decoder.apply_pin_config(self._scene, verbose=self._verbose)
         if param_decoder.cross_stitch:
@@ -549,7 +561,12 @@ class ParamDecoder:
     def cross_stitch(self) -> list:
         return self._cross_stitch
 
-    def apply_to_objects(self, scene: Scene, verbose: bool = False):
+    def apply_to_objects(
+        self,
+        scene: Scene,
+        verbose: bool = False,
+        solid_weight_transfers=None,
+    ):
         """Apply the loaded parameter data to the objects in ``scene``.
 
         Call :meth:`set_path` first. Per-object dicts (velocity,
@@ -560,6 +577,11 @@ class ParamDecoder:
         Args:
             scene (Scene): The scene to which the parameters will be applied.
             verbose (bool): Enable verbose logging.
+            solid_weight_transfers: Optional callable ``uuid -> transfer``
+                carrying a SOLID object's painted per-Blender-vertex map
+                weights onto its tetrahedra. Required for any tet object that
+                carries a spatial material map, whose weights are authored
+                against the Blender mesh and not the tetrahedralized one.
 
         Example:
             Load a pickle and apply per-object parameters to a populated scene::
@@ -572,6 +594,13 @@ class ParamDecoder:
         assert self._data is not None, "Parameter data not set. Call set_path() first."
         if verbose:
             print("=== Object Parameters ===")
+        # Keyframe times for every animated material in the scene. Set first so
+        # the scene carries them before any object's values arrive; the two are
+        # checked against each other at build, where the per-triangle arrays
+        # are assembled.
+        anim_times = self._data.get("param_anim_times")
+        if anim_times:
+            scene.set_param_anim_times(list(anim_times))
         for group_entry in self._data["group"]:
             params, objects = group_entry[0], group_entry[1]
             # Third tuple slot holds UUIDs aligned with ``objects``.
@@ -650,6 +679,35 @@ class ParamDecoder:
                                 obj.lock_translation(*a)
                         elif val is not None:
                             obj.lock_translation(*val)
+                    elif key == "lock-all-translations":
+                        # Lock All Translations: per-UUID bool pinning this
+                        # object's COM to its initial point rather than to a
+                        # line (see Object.lock_all_translations). The FLAG
+                        # carries the enable bit here, since an all-axes lock
+                        # has no direction: the encoder leaves such an object
+                        # out of "lock-translation" entirely, so a UUID with
+                        # no paired axis is the expected shape rather than an
+                        # error. Carrying both IS an error: they are two
+                        # mutually exclusive spellings of one lock, and an
+                        # encoder emitting both has a bug that must not be
+                        # resolved silently in either direction. Resolve the
+                        # paired axis explicitly rather than relying on map
+                        # iteration order.
+                        m = val.get(obj_uuid) if isinstance(val, dict) else val
+                        if m:
+                            axes = params.get("lock-translation")
+                            a = (
+                                axes.get(obj_uuid)
+                                if isinstance(axes, dict)
+                                else axes
+                            )
+                            if a is not None:
+                                raise ValueError(
+                                    f"lock-all-translations for {obj_uuid!r} also "
+                                    "carries a lock-translation axis; an all-axes "
+                                    "lock has no axis"
+                                )
+                            obj.lock_all_translations()
                     elif key == "lock-rotation":
                         # Lock Rotation: normalized world-space axis (already
                         # swapped to solver space) restricting this object's
@@ -687,6 +745,32 @@ class ParamDecoder:
                                 obj.lock_rotation_prohibit_axis(bool(m))
                         elif val is not None:
                             obj.lock_rotation_prohibit_axis(bool(val))
+                    elif key == "lock-all-rotations":
+                        # Lock All Rotations: per-UUID bool forbidding net
+                        # rotation about every axis (see
+                        # Object.lock_all_rotations). Read exactly like
+                        # "lock-all-translations" above, including why a
+                        # missing paired axis is expected and why carrying
+                        # both is refused. An all-locked object appears in
+                        # neither "lock-rotation" nor
+                        # "lock-rotation-prohibit-axis": the mode above
+                        # selects between two readings of an axis, and there
+                        # is no axis here for it to read.
+                        m = val.get(obj_uuid) if isinstance(val, dict) else val
+                        if m:
+                            axes = params.get("lock-rotation")
+                            a = (
+                                axes.get(obj_uuid)
+                                if isinstance(axes, dict)
+                                else axes
+                            )
+                            if a is not None:
+                                raise ValueError(
+                                    f"lock-all-rotations for {obj_uuid!r} also "
+                                    "carries a lock-rotation axis; an all-axes "
+                                    "lock has no axis"
+                                )
+                            obj.lock_all_rotations()
                     elif key in ("ftetwild", "soft-constraint"):
                         # Consumed at populate-time via the param.pickle peek;
                         # no per-object ParamHolder slot by design (would
@@ -696,8 +780,126 @@ class ParamDecoder:
                         # the KIND of pin the collider gets, which is decided
                         # while the pins are built.
                         pass
+                    elif key == "material-maps":
+                        # Spatial maps: weights are per vertex and keyed by
+                        # object uuid, so only this object's array is applied.
+                        # The base is the object's own param (or that frame's
+                        # animated value), so a mapped key may also be animated.
+                        self._apply_material_maps(
+                            obj, obj_uuid, val, solid_weight_transfers, verbose
+                        )
+                    elif key == "param-anim":
+                        # Sampled F-curves on this group's material sliders,
+                        # one value per entry in the scene-wide
+                        # `param_anim_times`. Set on every object in the group,
+                        # matching how the group's static params are applied.
+                        for anim_key, values in val.items():
+                            obj.set_param_anim(anim_key, values)
                     else:
                         obj.param.set(key, val)
+
+    @staticmethod
+    def _apply_material_maps(obj, obj_uuid, maps, solid_weight_transfers, verbose):
+        """Set one object's spatial maps, carrying a SOLID's onto its tets.
+
+        A group can hold several objects and a map may name only some of them,
+        so an absent uuid leaves the object unmapped. A uuid that IS named with
+        an empty array is a defect in the payload and raises.
+        """
+        rows = []
+        for map_key, entry in maps.items():
+            static = entry.get("weights")
+            animated = entry.get("weight_frames")
+            if static is not None and animated is not None:
+                raise ValueError(
+                    f"the '{map_key}' material map carries both a single "
+                    "weight array and a keyed sequence; it has one or the "
+                    "other"
+                )
+            if animated is not None:
+                times = entry.get("times")
+                if not times:
+                    raise ValueError(
+                        f"the '{map_key}' material map carries keyed weights "
+                        "with no times"
+                    )
+                per_object = animated.get(obj_uuid)
+                if per_object is None:
+                    continue
+                if len(per_object) != len(times):
+                    raise ValueError(
+                        f"the '{map_key}' material map has "
+                        f"{len(per_object)} weight arrays for object "
+                        f"{obj_uuid!r} but {len(times)} times"
+                    )
+                frames = [list(w) for w in per_object]
+                sample_times = [float(t) for t in times]
+            else:
+                weights = static or {}
+                if obj_uuid not in weights:
+                    continue
+                frames = [list(weights[obj_uuid])]
+                sample_times = [0.0]
+            if not all(frames):
+                raise ValueError(
+                    f"the '{map_key}' material map names object {obj_uuid!r} "
+                    "but carries no weights for it"
+                )
+            rows.append((map_key, frames, sample_times, float(entry["target"])))
+        if not rows:
+            return
+        if obj.obj_type != "tet":
+            for map_key, frames, sample_times, target in rows:
+                if len(frames) == 1:
+                    obj.set_param_spatial(map_key, frames[0], target)
+                else:
+                    obj.set_param_spatial_anim(
+                        map_key, frames, sample_times, target
+                    )
+            return
+        # A solid's simulated vertices are its TETRAHEDRALIZED ones, which the
+        # artist never sees and never paints. The weights arrive on the Blender
+        # mesh and are carried across, one factorization for every map on the
+        # object.
+        if solid_weight_transfers is None:
+            raise RuntimeError(
+                f"object {obj_uuid!r} is tetrahedralized and carries a "
+                "spatial material map, but no transfer was supplied to carry "
+                "the painted weights onto its tetrahedra"
+            )
+        import numpy as np
+
+        transfer = solid_weight_transfers(obj_uuid)
+        # The transfer is cached per canonical tet mesh, so its own recorded
+        # name is whichever instance built it. Name the object being decoded.
+        named = getattr(obj, "name", None) or obj_uuid
+        for map_key, frames, _times, _target in rows:
+            if len(frames) > 1:
+                raise ValueError(
+                    f"the '{map_key}' material map on "
+                    f"'{named}' is keyed over time, but a "
+                    "tetrahedralized object has no per-element material "
+                    "schedule"
+                )
+            if len(frames[0]) != transfer.n_blender:
+                raise ValueError(
+                    f"the '{map_key}' material map on "
+                    f"'{named}' has {len(frames[0])} weights "
+                    f"but its Blender mesh has {transfer.n_blender} vertices"
+                )
+        stacked = np.column_stack(
+            [np.asarray(frames[0], dtype=np.float64) for _k, frames, _t, _g in rows]
+        )
+        carried = transfer.apply(stacked, object_name=named)
+        for column, (map_key, _frames, _times, target) in enumerate(rows):
+            values = carried[:, column]
+            if verbose:
+                print(
+                    f"  material map '{map_key}' on '{named}': "
+                    f"tet weights in [{float(values.min()):.6f}, "
+                    f"{float(values.max()):.6f}]"
+                )
+            obj.set_param_spatial(map_key, values, target)
 
     def apply_to_session(self, session: Session, verbose: bool = False):
         """Apply scene-level and dynamic parameters from the loaded data to ``session``.
@@ -803,6 +1005,11 @@ class ParamDecoder:
                     # the embedded ops AND the rest-shape track for the whole
                     # holder. Falls back to the first non-None cfg when none is
                     # captured (unchanged for pure-anchor / single-intent holders).
+                    # One field is deliberately not read off this cfg: the
+                    # intersection allowance, which ``_apply_pin_cfg_entry``
+                    # reduces over every contributing pin instead, so a holder
+                    # spanning an allowing and a non-allowing pin does not
+                    # inherit the allowance from whichever cfg wins here.
                     chosen_vi = None
                     chosen_cfg = None
                     for vi in lookup_indices:
@@ -1258,6 +1465,33 @@ class ParamDecoder:
             pin_holder._data.pin_group_id = cfg["pin_group_id"]
             if verbose:
                 print(f"  {dyn_name}[{vi}]: pin_group_id={cfg['pin_group_id']}")
+        # Per-pin intersection allowance. Read from EVERY cfg the holder's
+        # vertices resolve to, not from the single chosen ``cfg``, because a
+        # holder can span more than one Blender pin: ``_regroup_pin_holders``
+        # leaves SOLID surface-mapped holders alone, and
+        # ``_split_solid_holder_by_threshold`` builds sub-holders whose stored
+        # Blender indices mix a captured pin with a static anchor. One holder
+        # carries one flag, so a mixed holder resolves to False, which is the
+        # same unanimity the solver applies per vertex (a vertex is exempt only
+        # when every pin covering it asks for it, and an unpinned vertex never
+        # is). Granting the flag on a mixed holder would instead exempt
+        # elements held by a pin that never asked; splitting the holder by flag
+        # would cut the pin grouping that the surface mapping and the threshold
+        # split are built around. A vertex whose cfg is absent belongs to a pin
+        # that emitted no settings at all, so it is a pin that did not ask.
+        # Applies to both pin modes and needs no operations, so it is resolved
+        # before the ops-only early return below.
+        lookup_indices = (
+            getattr(pin_holder._data, "_blender_pin_indices", None)
+            or pin_holder.index
+        )
+        allow_intersection = bool(lookup_indices) and all(
+            (obj_cfg.get(v) or {}).get("allow_intersection", False)
+            for v in lookup_indices
+        )
+        pin_holder._data.allow_intersection = allow_intersection
+        if verbose and allow_intersection:
+            print(f"  {dyn_name}[{vi}]: allow_intersection=True")
         if "operations" not in cfg and "embedded_move_index" not in cfg:
             return
         embedded_ops = self._build_embedded_move_ops(pin_holder, obj_cfg)
@@ -1901,46 +2135,77 @@ def _apply_sparse_frame_map(linear_map, values):
     return mapped.reshape(mapped.shape[0], n_frames, 3).transpose(1, 0, 2)
 
 
-def _build_harmonic_interior_operator(n_verts, tets, surf_ids, interior_ids):
+def _harmonic_interior_operator_strict(n_verts, tets, surf_ids, interior_ids):
     """Sparse map from surface values to a tet mesh's interior values.
 
     Solves the discrete Laplace equation with the surface vertices held as
     Dirichlet boundary conditions: partition the graph Laplacian
     ``L = D - A`` (``A`` = tet-edge adjacency) into interior (``I``) and
     surface (``S``) blocks and solve ``L_II u_I = -L_IS u_S``. The returned
-    map factors ``L_II`` once and applies only the right-hand sides the
-    captured animation needs. It never materializes the dense
-    ``-L_II^-1 L_IS`` operator.
+    map factors ``L_II`` once and applies only the right-hand sides the caller
+    needs. It never materializes the dense ``-L_II^-1 L_IS`` operator.
+
+    Each interior value is a convex combination of the surface values, so a
+    boundary field inside [0, 1] extends to an interior field inside [0, 1].
+
+    Raises:
+        RuntimeError: SciPy is unavailable, or ``L_II`` is singular because an
+            interior component has no edge path to the surface.
+        ValueError: the tet array is not ``(n, 4)``, or the surface or interior
+            index set is empty.
     """
     try:
         import warnings
 
         import numpy as np
         import scipy.sparse.linalg as spla
+    except Exception as exc:
+        raise RuntimeError(
+            "SciPy is required to extend a field into a tetrahedral mesh's "
+            "interior. Install the frontend dependencies with warmup.py "
+            "(warmup.bat on Windows)."
+        ) from exc
+    T = np.asarray(tets, dtype=np.int64)
+    if T.ndim != 2 or T.shape[1] != 4:
+        raise ValueError(
+            f"expected a (n, 4) tet array, got shape {tuple(T.shape)}"
+        )
+    inter = np.asarray(interior_ids, dtype=np.int64)
+    surf = np.asarray(surf_ids, dtype=np.int64)
+    if surf.size == 0:
+        raise ValueError("the tet mesh has no surface vertices to extend from")
+    if inter.size == 0:
+        raise ValueError("the tet mesh has no interior vertices to extend into")
+    pairs = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+    e0 = np.concatenate([T[:, a] for a, _ in pairs])
+    e1 = np.concatenate([T[:, b] for _, b in pairs])
+    L = _graph_laplacian_from_edges(e0, e1, n_verts)
+    L_II = L[inter][:, inter].tocsc()
+    L_IS = L[inter][:, surf].tocsc()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", spla.MatrixRankWarning)
+        try:
+            return _SparseLinearMap(L_II, -L_IS)
+        except Exception as exc:
+            raise RuntimeError(
+                "an interior region of this tetrahedral mesh has no edge path "
+                "to its surface, so no boundary value determines it"
+            ) from exc
+
+
+def _build_harmonic_interior_operator(n_verts, tets, surf_ids, interior_ids):
+    """`_harmonic_interior_operator_strict`, or None when it cannot be built.
+
+    The pin paths degrade to a surface-only pin set, which is the behavior
+    every partial-pin SOLID scene was authored against. A material value has no
+    correct degraded answer, so the map transfer calls the strict builder.
+    """
+    try:
+        return _harmonic_interior_operator_strict(
+            n_verts, tets, surf_ids, interior_ids
+        )
     except Exception:
         _warn_if_scipy_missing("_build_harmonic_interior_operator")
-        return None
-    try:
-        T = np.asarray(tets, dtype=np.int64)
-        if T.ndim != 2 or T.shape[1] != 4:
-            return None
-        inter = np.asarray(interior_ids, dtype=np.int64)
-        surf = np.asarray(surf_ids, dtype=np.int64)
-        if inter.size == 0 or surf.size == 0:
-            return None
-        pairs = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
-        e0 = np.concatenate([T[:, a] for a, _ in pairs])
-        e1 = np.concatenate([T[:, b] for _, b in pairs])
-        L = _graph_laplacian_from_edges(e0, e1, n_verts)
-        L_II = L[inter][:, inter].tocsc()
-        L_IS = L[inter][:, surf].tocsc()
-        # A singular L_II means an interior component has no path to the
-        # surface, for example an enclosed void. SuperLU raises during
-        # factorization and the caller takes the surface-only path.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", spla.MatrixRankWarning)
-            return _SparseLinearMap(L_II, -L_IS)
-    except Exception:
         return None
 
 
@@ -1954,6 +2219,172 @@ def _surface_graph_laplacian(tris, n_surf):
     e0 = np.concatenate([T[:, 0], T[:, 1], T[:, 2]])
     e1 = np.concatenate([T[:, 1], T[:, 2], T[:, 0]])
     return _graph_laplacian_from_edges(e0, e1, n_surf)
+
+
+class _SolidWeightTransfer:
+    """Carries a per-Blender-vertex weight field onto a tet mesh's vertices.
+
+    Two stages, both convex combinations of painted values:
+
+    * every tet SURFACE vertex takes the weights of the Blender triangle
+      closest to it, combined with clipped and renormalized frame
+      coefficients;
+    * every tet INTERIOR vertex takes the Dirichlet Laplace extension of the
+      tet surface values.
+
+    A weight field inside [0, 1] therefore reaches the tet vertices inside
+    [0, 1] in exact arithmetic. `tolerance` is the extension operator's own
+    measured partition-of-unity residual, which bounds the rounding the second
+    stage can introduce; a value outside the interval by more than that is a
+    defect and raises rather than being clipped out of sight.
+    """
+
+    def __init__(
+        self,
+        object_name,
+        n_blender,
+        n_tet,
+        surf_ids,
+        interior_ids,
+        surface_map,
+        interior_map,
+        tolerance,
+    ):
+        self.object_name = object_name
+        self.n_blender = int(n_blender)
+        self.n_tet = int(n_tet)
+        self._surf_ids = surf_ids
+        self._interior_ids = interior_ids
+        self._surface_map = surface_map
+        self._interior_map = interior_map
+        self.tolerance = float(tolerance)
+
+    def apply(self, weights, object_name=None):
+        """`weights` per Blender vertex mapped to one value per tet vertex.
+
+        `object_name` names the CALLER, because one transfer is shared by every
+        instance of a canonical tet mesh and the name it was built from is
+        whichever instance came first.
+
+        Accepts a single field of shape ``(n_blender,)`` or a stack of them of
+        shape ``(n_blender, k)``, which shares the one factorization across
+        every map on the object.
+        """
+        import numpy as np
+
+        w = np.asarray(weights, dtype=np.float64)
+        one_field = w.ndim == 1
+        if one_field:
+            w = w.reshape(-1, 1)
+        named = object_name or self.object_name
+        if w.ndim != 2 or w.shape[0] != self.n_blender:
+            raise ValueError(
+                f"a material map on '{named}' has "
+                f"{w.shape[0]} weights but its Blender mesh has "
+                f"{self.n_blender} vertices"
+            )
+        out = np.zeros((self.n_tet, w.shape[1]), dtype=np.float64)
+        surface = np.asarray(self._surface_map @ w, dtype=np.float64)
+        out[self._surf_ids] = surface
+        if self._interior_map is not None:
+            out[self._interior_ids] = self._interior_map.apply(surface)
+        lo, hi = float(out.min()), float(out.max())
+        if lo < -self.tolerance or hi > 1.0 + self.tolerance:
+            raise ValueError(
+                f"carrying a material map onto the tetrahedra of "
+                f"'{named}' produced weights in [{lo}, {hi}], "
+                f"outside [0, 1] by more than the extension operator's "
+                f"residual of {self.tolerance}"
+            )
+        np.clip(out, 0.0, 1.0, out=out)
+        return out.ravel() if one_field else out
+
+
+def _build_solid_weight_transfer(tet_mesh, F_arr, object_name):
+    """The `_SolidWeightTransfer` for one tetrahedralized object.
+
+    Raises rather than degrading: a pin set has a defensible surface-only
+    reading, and a material value does not.
+    """
+    import numpy as np
+    import scipy.sparse as sp
+
+    from ._bvh_ import frame_mapping
+
+    bl = getattr(tet_mesh, "_pin_blender_surface", None)
+    if bl is None:
+        raise RuntimeError(
+            f"object '{object_name}' carries no record of the Blender surface "
+            "its tetrahedra were built from, so a material map cannot be "
+            "carried onto them. Transfer the scene again."
+        )
+    bl_verts = np.ascontiguousarray(np.asarray(bl[0], dtype=np.float64))
+    bl_tris = np.ascontiguousarray(np.asarray(bl[1], dtype=np.int64)).reshape(-1, 3)
+    if bl_tris.shape[0] == 0:
+        raise RuntimeError(
+            f"object '{object_name}' has no Blender triangles, so there is no "
+            "surface to read its material map weights from"
+        )
+    V_local = np.ascontiguousarray(np.asarray(tet_mesh[0], dtype=np.float64))
+    n_tet = int(V_local.shape[0])
+    n_blender = int(bl_verts.shape[0])
+    sim_surf_ids = np.unique(np.asarray(F_arr, dtype=np.int64).reshape(-1))
+    n_surf = int(sim_surf_ids.size)
+    if n_surf == 0:
+        raise RuntimeError(
+            f"object '{object_name}' has no tetrahedral surface vertices to "
+            "carry a material map onto"
+        )
+
+    # Inverse direction: each tet surface vertex takes the Blender triangle
+    # closest to it. The forward map is not surjective onto tet surface
+    # vertices, so it would leave some of them with no painted value at all.
+    tri_idx, coefs = frame_mapping(V_local[sim_surf_ids], bl_verts, bl_tris)
+    tri_idx = np.asarray(tri_idx, dtype=np.int64)
+    if (tri_idx < 0).any():
+        raise RuntimeError(
+            f"{int((tri_idx < 0).sum())} tetrahedral surface vertices of "
+            f"'{object_name}' matched no Blender triangle"
+        )
+    c = np.asarray(coefs, dtype=np.float64).reshape(-1, 3)
+    bary = np.stack([1.0 - c[:, 0] - c[:, 1], c[:, 0], c[:, 1]], axis=1)
+    np.clip(bary, 0.0, None, out=bary)
+    total = bary.sum(axis=1)
+    # A degenerate target triangle returns zero coefficients, which names the
+    # triangle's first vertex. That is still one painted value, so the row
+    # stays a convex combination.
+    degenerate = total <= 1e-12
+    bary[degenerate] = (1.0, 0.0, 0.0)
+    total[degenerate] = 1.0
+    bary /= total[:, None]
+    cols = bl_tris[tri_idx].reshape(-1)
+    rows = np.repeat(np.arange(n_surf, dtype=np.int64), 3)
+    surface_map = sp.coo_matrix(
+        (bary.reshape(-1), (rows, cols)), shape=(n_surf, n_blender)
+    ).tocsr()
+
+    interior_ids = np.setdiff1d(np.arange(n_tet, dtype=np.int64), sim_surf_ids)
+    interior_map = None
+    residual = 0.0
+    if interior_ids.size:
+        interior_map = _harmonic_interior_operator_strict(
+            n_tet, tet_mesh[2], sim_surf_ids, interior_ids
+        )
+        # The extension is exact on a constant field, so what it returns for
+        # all-ones measures the rounding it introduces on any field.
+        ones = interior_map.apply(np.ones(n_surf, dtype=np.float64))
+        residual = float(np.max(np.abs(ones - 1.0)))
+    tolerance = max(residual, float(np.finfo(np.float32).eps))
+    return _SolidWeightTransfer(
+        object_name,
+        n_blender,
+        n_tet,
+        sim_surf_ids,
+        interior_ids,
+        surface_map,
+        interior_map,
+        tolerance,
+    )
 
 
 def _build_solid_pin_fields(
@@ -2119,6 +2550,11 @@ class SceneDecoder:
         self._asset = asset_manager
         self._mesh = mesh_manager
         self._object_info: dict[str, ObjectInfo] = {}  # uuid -> ObjectInfo for stitch generation
+        # What a SOLID needs to carry a painted map onto its tetrahedra, and
+        # the built transfers. Recorded per object, cached per canonical ASSET,
+        # so two instances of one tet mesh share a factorization.
+        self._solid_weight_inputs: dict[str, tuple] = {}
+        self._solid_weight_transfers: dict[str, object] = {}
 
     @staticmethod
     def _tetra_cache_name(tri_mesh, ftw_kwargs) -> str:
@@ -2267,6 +2703,18 @@ class SceneDecoder:
                     _obj, tet_mesh, V, F = self._populate_solid(
                         scene, obj, entry, name, obj_uuid, vert,
                         object_entries, tetra_jobs, ftetwild_by_uuid, progress,
+                    )
+                    # Recorded here rather than inside `_populate_solid`, whose
+                    # Blender-surface block is skipped for an object reusing an
+                    # earlier object's tetrahedralization.
+                    reuse_from = entry.get("tetra_reuse_from")
+                    self._solid_weight_inputs[obj_uuid] = (
+                        object_entries[reuse_from]["name"]
+                        if reuse_from is not None
+                        else name,
+                        tet_mesh,
+                        F,
+                        name,
                     )
                 elif group_type == "SHELL":
                     _obj = self._populate_shell(
@@ -2785,6 +3233,34 @@ class SceneDecoder:
             _static_obj.mat4x4(transform)
         _static_obj.pin()
         return None
+
+    def solid_weight_transfer(self, obj_uuid: str):
+        """The `_SolidWeightTransfer` for one tetrahedralized object.
+
+        Built on first use and cached by canonical ASSET name, so two
+        instances of one tetrahedral mesh share a single factorization.
+        """
+        inputs = self._solid_weight_inputs.get(obj_uuid)
+        if inputs is None:
+            raise RuntimeError(
+                f"object {obj_uuid!r} carries a spatial material map but was "
+                "not recorded as a tetrahedralized object during populate"
+            )
+        asset_name, tet_mesh, F_arr, name = inputs
+        transfer = self._solid_weight_transfers.get(asset_name)
+        if transfer is None:
+            transfer = _build_solid_weight_transfer(tet_mesh, F_arr, name)
+            self._solid_weight_transfers[asset_name] = transfer
+        return transfer
+
+    def release_solid_weight_transfers(self) -> None:
+        """Drop the built transfers and the inputs they were built from.
+
+        Each holds a sparse system and a SuperLU factor, which are wanted only
+        while the maps are being applied.
+        """
+        self._solid_weight_inputs.clear()
+        self._solid_weight_transfers.clear()
 
     def _populate_solid(
         self,

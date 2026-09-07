@@ -112,12 +112,20 @@ linux_install() {
       if [ "$(id -u)" -ne 0 ]; then
         sudo_cmd="sudo "
       fi
+      # Wait for the dpkg lock rather than racing it. A freshly booted CI
+      # instance runs unattended-upgrades, which holds
+      # /var/lib/dpkg/lock-frontend for the first minute or two; without
+      # this the install fails outright, Blender's runtime libs never land,
+      # `blender --version` prints nothing, and the addon installer dies on
+      # "Could not parse version". DPkg::Lock::Timeout makes apt block up to
+      # the given seconds for the lock instead.
+      local apt_lock="-o DPkg::Lock::Timeout=300"
       # Don't fail the whole script if `apt-get update` errors on a
       # third-party repo (e.g. AWS hosts pin a Radeon repo that may
       # change its Origin/Label between releases). The install step
       # still works against the cached package metadata.
-      ${sudo_cmd}apt-get update -qq || echo "warn: apt-get update partial; proceeding"
-      if ! ${sudo_cmd}apt-get install -y --no-install-recommends "${missing[@]}"; then
+      ${sudo_cmd}apt-get $apt_lock update -qq || echo "warn: apt-get update partial; proceeding"
+      if ! ${sudo_cmd}apt-get $apt_lock install -y --no-install-recommends "${missing[@]}"; then
         echo "warn: apt install failed for ${missing[*]}; an existing Blender may still work"
       fi
     else

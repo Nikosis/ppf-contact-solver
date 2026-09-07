@@ -43,6 +43,8 @@ from .state_types import (
     InvisibleColliderKeyframe,
     InvisibleColliderItem,
     AssignedObject,
+    MaterialMapItem,
+    MaterialMapSample,
     PinOperation,
     PinVertexGroupItem,
     StaticOpItem,
@@ -220,8 +222,21 @@ class SSHState(PropertyGroup):
             "the host, if it has one"
         ),
     )  # pyright: ignore
+    # The published image builds the solver at /root/ppf-contact-solver
+    # (Dockerfile: PROJ_NAME=ppf-contact-solver, WORKDIR /root/${PROJ_NAME}),
+    # so the field is already right for a reader who followed the public
+    # docker run. It carries a default rather than a blank because the path
+    # exists only inside the container: no public instruction prints it, and
+    # from outside it can be read only by entering the running container.
     docker_path: StringProperty(
-        name="Container Path", default=""
+        name="Container Path",
+        default="/root/ppf-contact-solver",
+        description=(
+            "Directory INSIDE the container that holds the solver, i.e. the "
+            "one with target/release/ppf-cts-server under it. For the "
+            "published image this is /root/ppf-contact-solver, which is the "
+            "default. Not a path on the machine Blender runs on"
+        ),
     )  # pyright: ignore
     local_path: StringProperty(
         name="Path",
@@ -247,7 +262,21 @@ class SSHState(PropertyGroup):
         default="CUSTOM",
     )
     command: StringProperty(name="SSH Command", default="ssh -p xxx root@zzz")  # pyright: ignore
-    container: StringProperty(name="Container", default="ppf-dev")  # pyright: ignore
+    # The default names the container the project's own public instructions
+    # create (README's `docker run --name ppf-contact-solver`), so the field is
+    # already right for a reader who followed them. The previous default,
+    # `ppf-dev`, is the name of this project's internal development container
+    # and appears in no public instruction, so it matched nothing a community
+    # user had and every first connection failed on it.
+    container: StringProperty(
+        name="Container",
+        default="ppf-contact-solver",
+        description=(
+            "Name of the Docker container running the solver, as 'docker ps' "
+            "lists it. The container must already exist; the add-on starts a "
+            "stopped one but does not create one"
+        ),
+    )  # pyright: ignore
     ssh_remote_path: StringProperty(
         name="Remote Path", default=""
     )  # pyright: ignore
@@ -996,10 +1025,34 @@ class State(PropertyGroup):
         default="{}",
         description="JSON string storing mesh topology hash for validation",
     )  # pyright: ignore
+    # Held from the geometry encode until the upload is accepted, so a
+    # Transfer refused after that encode does not record its topology as
+    # transferred and silence the stale-topology warning.
+    pending_mesh_hash_json: StringProperty(
+        name="Pending Mesh Hash JSON",
+        default="",
+        options={"HIDDEN"},
+    )  # pyright: ignore
 
     def set_mesh_hash(self, hash_data: dict):
         """Store mesh hash data as JSON string."""
         self.mesh_hash_json = json.dumps(hash_data)
+
+    def set_pending_mesh_hash(self, hash_data: dict):
+        """Hold a topology summary until the upload it describes is accepted.
+
+        The encoder computes it, but a Transfer can still be refused after the
+        geometry encode: a parameter refusal, a failed connection. Recording it
+        as transferred at compute time would suppress the stale-topology
+        warning for a scene that never reached the wire.
+        """
+        self.pending_mesh_hash_json = json.dumps(hash_data)
+
+    def commit_pending_mesh_hash(self):
+        """Promote the held topology summary, if there is one."""
+        if self.pending_mesh_hash_json:
+            self.mesh_hash_json = self.pending_mesh_hash_json
+            self.pending_mesh_hash_json = ""
 
     def get_mesh_hash(self) -> dict:
         """Retrieve mesh hash data from JSON string."""
@@ -1053,6 +1106,8 @@ classes = [
     AssignedObject,
     PinOperation,
     PinVertexGroupItem,
+    MaterialMapSample,
+    MaterialMapItem,
     ObjectGroup,
     MergePairItem,
     DynParamKeyframe,

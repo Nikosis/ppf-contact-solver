@@ -136,8 +136,42 @@ def _reconcile_manifest_on_load(*_args):
     except Exception:
         pass
     try:
+        # The addon's own scene-parameter keyframe list is superseded by real
+        # F-curves on the sliders. Convert on load so a saved scene keeps
+        # working and the artist sees the curves on the timeline where every
+        # other keyframe lives.
+        from .core.migrate_dyn_params import (
+            convert_legacy_dyn_params,
+            count_legacy_dyn_params,
+        )
+        if count_legacy_dyn_params(bpy.context.scene):
+            summary = convert_legacy_dyn_params(bpy.context.scene)
+            if summary:
+                from .models.console import console
+                console.write(f"[auto-migrate] {summary}")
+    except Exception:
+        pass
+    try:
         from .core.manifest import reconcile_on_load
         reconcile_on_load()
+    except Exception:
+        pass
+
+
+@persistent
+def _request_cache_heal_on_load(*_args):
+    """load_post hook: owe the frame pump one MESH_CACHE heal pass.
+
+    Blender cancels every modal operator when a file is loaded, and the
+    pump is not resident, so nothing would otherwise notice that the
+    freshly opened scene may carry a ContactSolverCache to rebind. The
+    request only sets a flag; the pump starts on the next persistent
+    tick and does the work in the modal-operator context those ID writes
+    require.
+    """
+    try:
+        from .core.frame_pump import request_heal
+        request_heal()
     except Exception:
         pass
 
@@ -227,6 +261,29 @@ def register():
         raise
 
 
+def _warn_if_cbor2_missing() -> None:
+    """Print a console warning when the bundled cbor2 wheel is not installed.
+
+    Blender installs the wheels named in ``blender_manifest.toml`` when it
+    installs the extension, and it does NOT refuse to enable one whose wheel
+    files are absent: an add-on directory placed under
+    ``extensions/user_default`` by hand, or copied from a checkout whose
+    gitignored ``wheels/*.whl`` were never fetched, enables normally and
+    registers every operator. The first sign of trouble then arrives much
+    later, from a Transfer that cannot encode, with nothing connecting it to
+    the install. Saying it here puts the diagnosis at the moment the
+    condition is created.
+
+    This warns rather than raising. Raising would leave the add-on disabled,
+    and the recovery the user needs, the "Install cbor2 to Add-on Directory"
+    button, lives in the add-on's own panel.
+    """
+    from .core.module import CBOR2_MISSING_MESSAGE, cbor2_available
+    if cbor2_available():
+        return
+    print(f"ZOZO's Contact Solver: {CBOR2_MISSING_MESSAGE}")
+
+
 def _register_body():
     global reload_server
     # Register translation catalogs first so the very first UI draw is
@@ -239,6 +296,8 @@ def _register_body():
     mesh_ops.register()
     console.register()
     zozo_contact_solver.register()
+
+    _warn_if_cbor2_missing()
 
     # Start the persistent engine timer
     from .core.facade import ensure_engine_timer
@@ -343,6 +402,11 @@ def _register_body():
         for h in bpy.app.handlers.load_post
     ):
         bpy.app.handlers.load_post.append(_reconcile_pin_captured_anim_on_load)
+    if not any(
+        getattr(h, "__name__", "") == "_request_cache_heal_on_load"
+        for h in bpy.app.handlers.load_post
+    ):
+        bpy.app.handlers.load_post.append(_request_cache_heal_on_load)
     if not any(
         getattr(h, "__name__", "") == "_disconnect_on_load"
         for h in bpy.app.handlers.load_pre
@@ -494,6 +558,7 @@ def unregister():
             if getattr(h, "__name__", "") in (
                 "_reconcile_manifest_on_load",
                 "_reconcile_pin_captured_anim_on_load",
+                "_request_cache_heal_on_load",
             ):
                 bpy.app.handlers.load_post.remove(h)
         for h in list(bpy.app.handlers.load_pre):

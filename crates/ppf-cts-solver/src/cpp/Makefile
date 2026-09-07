@@ -43,12 +43,12 @@ NVCC_FLAGS=-std=c++17 -O3 -MMD --device-c -Xcompiler -fPIC -D__NVCC__ --expt-rel
 NVCC_FLAGS += $(foreach warn,$(SUPPRESS_WARNINGS),--diag-suppress=$(warn))
 
 # Device link-time optimization (LTO). Compile each TU to an LTO intermediate
-# (code=lto_86); the device link below (-dlto) runs whole-program optimization,
+# (code=lto_<floor>); the device link below (-dlto) runs whole-program optimization,
 # inlining the cross-TU barrier::compute_stiffness into the contact-Hessian embed
 # kernels (a 255-register ABI call otherwise) and roughly halving contact
 # matrix-assembly cost.
 #
-# The LTO IR sits at the floor virtual arch (compute_86 as shipped), and every
+# The LTO IR sits at the floor virtual arch (compute_75 as shipped), and every
 # device target in the link below emits native SASS from that IR.
 # IMPORTANT: device LTO CANNOT embed a JIT-able PTX. The -dlto link lowers its IR
 # straight to SASS; a code=compute_XX request is silently dropped (verified with
@@ -99,12 +99,14 @@ $(OUT_DIR)/cpp/%.o: %.cpp Makefile
 	mkdir -p $(@D)
 	$(NVCC) -c $(NVCC_CPP_FLAGS) $< -o $@
 
-# Link CUDA library: -dlto runs whole-program optimization on the lto_86 objects
+# Link CUDA library: -dlto runs whole-program optimization on the lto_<floor> objects
 # and emits one native SASS cubin per architecture (no PTX, see the note above).
 # SASS is binary-compatible forward within a major version, so the sm_86 cubin
 # also runs sm_87 (Jetson Orin) and sm_89 (Ada: RTX 40, L40S); each new MAJOR
 # needs its own cubin. A brand-new arch not listed here fails to launch ("named
 # symbol not found") until its cubin is added and the lib rebuilt.
+#   sm_75  Turing     RTX 20, GTX 16, T4     (oldest shipped; requested, and
+#                                             the self-hosted CI runner's card)
 #   sm_86  Ampere     RTX 30, A10/A40/A6000  (+ sm_87 Orin, sm_89 Ada via compat)
 #   sm_89  Ada        RTX 40, L40S, L4       (native; perf on the dev/CI GPU)
 #   sm_90  Hopper     H100, H200, GH200
@@ -135,7 +137,7 @@ $(OUT_DIR)/cpp/%.o: %.cpp Makefile
 # in 'lto.cubin'").
 #
 # -t belongs on this link ONLY, never on the compile rule above. That rule
-# builds a single arch (lto_86), where -t has nothing to overlap and measured no
+# builds a single arch, where -t has nothing to overlap and measured no
 # gain (solver.cu: 5.3 s with -t 16 vs 5.4 s without), and make already runs the
 # compiles -j wide, so each of the 17 would stack its own thread pool on top.
 # The manifest is a prerequisite because the -gencode list is derived from it:

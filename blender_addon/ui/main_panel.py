@@ -7,6 +7,7 @@
 # operator registration.  Extracted from ui/client.py.
 
 import os
+import textwrap
 from dataclasses import dataclass
 
 import bpy  # pyright: ignore
@@ -27,7 +28,9 @@ from ..core.utils import (
     WINDOWS_MAX_PATH,
     find_invalid_name_char,
     find_invalid_path_char,
+    find_shell_unsafe_path_char,
     get_category_name,
+    resolve_local_path,
     windows_long_paths_enabled,
     windows_path_too_long,
 )
@@ -82,6 +85,7 @@ from .solver_control_ops import (
 )
 from .geometry_cleanup_ops import (
     MESH_OT_RemoveIsolatedVertices,
+    MESH_OT_TriangulateDegenerateFaces,
     classes as geometry_cleanup_classes,
 )
 
@@ -156,6 +160,22 @@ def _our_server_responding_in_error(error_msg: str) -> bool:
     return ours
 
 
+def _draw_error_lines(layout, error: str) -> None:
+    """Draw a connection error across as many label rows as it needs.
+
+    A single label renders one line and Blender clips the overflow without
+    marking the cut, which is the same limit ``_CRASH_DETAIL_CHARS`` exists
+    for. A connection refusal is not a summary with a fuller report behind it
+    though: it IS the whole report, and the part that gets clipped is the part
+    that says what to do (which folder to pick, which flag to add). So it is
+    wrapped rather than truncated, and the icon goes on the first row so the
+    block reads as one error.
+    """
+    lines = textwrap.wrap(error, width=_CRASH_DETAIL_CHARS) or [error]
+    for i, line in enumerate(lines):
+        layout.label(text=line, icon="ERROR" if i == 0 else "BLANK1")
+
+
 def _crash_detail_line(server_error: str, crash_kind: str) -> str:
     """The solver's own one-line detail out of a rendered crash report.
 
@@ -178,14 +198,28 @@ def _crash_detail_line(server_error: str, crash_kind: str) -> str:
     return detail
 
 
-def _draw_path_warning(layout, path) -> bool:
-    """Draw a one-line warning when *path* holds a space or shell-unsafe
-    character, and return ``True`` so the caller can skip any follow-up status
-    line.  Draws nothing and returns ``False`` for a valid (or blank) path.
+def _draw_path_warning(layout, path, *, shell_bound: bool = True) -> bool:
+    """Draw a one-line warning when *path* holds a character its backend
+    cannot carry, and return ``True`` so the caller can skip any follow-up
+    status line.  Draws nothing and returns ``False`` for a valid (or blank)
+    path.
+
+    ``shell_bound`` is what the path's backend does with it. A REMOTE path is
+    interpolated into a shell command on the solver host, so it refuses
+    whitespace as well as metacharacters. The Windows Native root is only
+    ever an ``os.path.join`` base and a ``subprocess.Popen`` ``cwd``, so it
+    refuses metacharacters alone; each caller passes what is true of its own
+    backend, and the Connect gate reads the matching predicate.
     """
-    if find_invalid_path_char(path) is None:
+    bad = (find_invalid_path_char(path) if shell_bound
+           else find_shell_unsafe_path_char(path))
+    if bad is None:
         return False
-    layout.label(text="Path should not contain spaces or special characters", icon="ERROR")
+    layout.label(
+        text=("Path should not contain spaces or special characters"
+              if shell_bound else "Path should not contain special characters"),
+        icon="ERROR",
+    )
     return True
 
 
@@ -199,7 +233,7 @@ def _draw_win_native_status(layout, win_path) -> None:
     selected, or an ERROR when no ancestor holds ``ppf-cts-server.exe``.
     No-op for a blank path.
     """
-    win_path = (win_path or "").strip().rstrip("/\\")
+    win_path = resolve_local_path(win_path or "").rstrip("/\\")
     if not win_path:
         return
     from ..core.connection import resolve_win_native_root
@@ -315,7 +349,7 @@ def _draw_long_path_warning(layout, path, project_name) -> bool:
     """
     if windows_long_paths_enabled():
         return False
-    projected = windows_path_too_long(path, project_name)
+    projected = windows_path_too_long(resolve_local_path(path), project_name)
     if projected is None:
         return False
     layout.label(
@@ -482,7 +516,10 @@ class MAIN_PT_RemotePanel(Panel):
                 col.prop(props, "container")
             if props.server_type == "WIN_NATIVE":
                 col.prop(props, "win_native_path")
-                if not _draw_path_warning(col, props.win_native_path):
+                # Held to the same rule the Connect gate uses for this
+                # backend, so the warning and the button never disagree.
+                if not _draw_path_warning(col, props.win_native_path,
+                                          shell_bound=False):
                     _draw_win_native_status(col, props.win_native_path)
                     _draw_long_path_warning(col, props.win_native_path, state.project_name)
             elif props.server_type == "LOCAL":
@@ -585,7 +622,7 @@ class MAIN_PT_RemotePanel(Panel):
             is_port_error = "in use" in err_lower and "port" in err_lower
             stale_port_error = is_port_error and _our_server_responding_in_error(error)
             if not stale_port_error:
-                layout.label(text=error, icon="ERROR")
+                _draw_error_lines(layout, error)
                 if is_port_error:
                     layout.operator(
                         SOLVER_OT_ForceTerminatePort.bl_idname, icon="X",
@@ -597,6 +634,20 @@ class MAIN_PT_RemotePanel(Panel):
                     layout.operator(
                         MESH_OT_RemoveIsolatedVertices.bl_idname, icon="TRASH",
                     )
+                elif "no usable rest shape" in err_lower:
+                    # The failing Transfer already opened a dialog carrying
+                    # this button, but a dismissed dialog must not take the
+                    # repair with it, so the panel keeps offering it for as
+                    # long as the error stands. Only when triangulating is the
+                    # right repair, which the message says: a face that is
+                    # already a triangle has no other split, and one that is
+                    # degenerate itself has no sound split at all. Splitting
+                    # either would change the mesh without fixing it.
+                    if "triangulate faces" in err_lower:
+                        layout.operator(
+                            MESH_OT_TriangulateDegenerateFaces.bl_idname,
+                            icon="MOD_TRIANGULATE",
+                        )
 
         server_error = com.server_error
         crash_kind = com.crash_kind

@@ -27,15 +27,18 @@ from ..core.client import RemoteStatus
 from ..core.client import communicator as com
 from ..core.derived import is_server_busy_from_response as is_running
 from ..core.encoder import prepare_upload
-from ..core.module import Cbor2NotInstalledError
+from ..core.module import Cbor2NotInstalledError, cbor2_available
 from ..core.encoder.mesh import compute_data_hash, encode_obj_with_hash
 from ..core.encoder.params import compute_param_hash, encode_param_with_hash
 from ..core.pc2 import (
     MODIFIER_NAME,
+    assigned_uuids_in_active_groups,
+    find_orphan_solver_caches,
     get_pc2_dir,
     get_pc2_path,
     has_mesh_cache,
     object_pc2_key_readonly,
+    remove_orphan_solver_cache,
 )
 from ..core.uuid_registry import get_object_uuid
 from ..core.utils import (
@@ -48,6 +51,7 @@ from ..models.groups import (
     has_simulatable_dynamics,
     iterate_active_object_groups,
 )
+from .geometry_cleanup_ops import popup_transfer_error
 from .dynamics.bake_ops import bake_progress_snapshot, is_bake_running
 from .dynamics.pin_capture_ops import (
     is_pin_capture_running,
@@ -99,16 +103,25 @@ def _draw_progress(layout, done, total, status_text, icon, abort_op):
 def _find_missing_pc2_paths(context) -> list[str]:
     """Every referenced-but-missing PC2 path, in deterministic order.
 
-    Two kinds of reference:
+    Two kinds of reference, both scoped to objects assigned to an ACTIVE
+    object group:
       * MESH with ``ContactSolverCache``: ``mod.filepath`` resolved via
         ``bpy.path.abspath`` — the file Blender plays back.
-      * CURVE assigned to an active simulation group: the basename-
-        derived ``get_pc2_path(key)`` — curves have no modifier, playback
-        reads this path directly.
+      * CURVE: the basename-derived ``get_pc2_path(key)`` — curves have no
+        modifier, playback reads this path directly.
+
+    The scope is load-bearing, and it is the same scope
+    ``scene_has_solver_cache`` takes. A ``ContactSolverCache`` outlives its
+    group membership: duplicating a simulated object copies the modifier
+    onto a copy that belongs to no group, and pointing that copy at a file
+    that does not exist is enough to raise this warning. Clear Local
+    Animation only clears assigned objects, so an unscoped warning names a
+    path that nothing in the UI can act on, and it stays on screen for the
+    life of the file.
 
     Gated on ``bpy.data.filepath`` (path resolution is meaningless for
-    an unsaved scene) and on at least one mesh modifier existing
-    anywhere (proxy for "a sim has been run"), otherwise absent PC2
+    an unsaved scene) and on at least one assigned mesh carrying the
+    modifier (proxy for "a sim has been run"), otherwise absent PC2
     files are the expected state for a fresh project.
     """
     if not bpy.data.filepath:
@@ -134,11 +147,20 @@ def _find_missing_pc2_paths(context) -> list[str]:
     # rather than an ``os.path.exists`` per file.
     candidates: list[str] = []
     saw_modifier = False
+    active_uuids = assigned_uuids_in_active_groups(context.scene)
     for obj in bpy.data.objects:
         if obj.type != "MESH":
             continue
         mod = obj.modifiers.get(MODIFIER_NAME)
         if mod is None or not mod.filepath:
+            continue
+        # Read-only key: draw must never mutate, and the side-effecting
+        # variant runs an O(N) duplicate scan per object (O(N^2) overall,
+        # ~0.6s on a 1.6k-object scene). An object that owns a cache was
+        # already assigned a UUID at capture time, so an empty key here
+        # means "no cache", and it is not in the assigned set either.
+        key = object_pc2_key_readonly(obj)
+        if key not in active_uuids:
             continue
         saw_modifier = True
         # Modifier's stored filepath — what MESH_CACHE plays back from.
@@ -147,24 +169,11 @@ def _find_missing_pc2_paths(context) -> list[str]:
         # code paths read. Diverges from mod.filepath after a rename or
         # OS-copy of the .blend (mod.filepath still points at the old
         # data/<basename>/ folder, canonical now targets the new one).
-        # Read-only key: draw must never mutate, and the side-effecting
-        # variant runs an O(N) duplicate scan per object (O(N^2) overall,
-        # ~0.6s on a 1.6k-object scene). An object that owns a cache was
-        # already assigned a UUID at capture time, so an empty key here
-        # means "no cache" and the canonical check is skipped.
-        key = object_pc2_key_readonly(obj)
-        if key:
-            candidates.append(get_pc2_path(key))
+        candidates.append(get_pc2_path(key))
 
     if not saw_modifier:
         return []
 
-    active_uuids = {
-        assigned.uuid
-        for group in iterate_active_object_groups(context.scene)
-        for assigned in group.assigned_objects
-        if assigned.uuid
-    }
     for obj in bpy.data.objects:
         if obj.type != "CURVE":
             continue
@@ -208,12 +217,20 @@ def _detect_pc2_basename_mismatch(context):
     the new one, old folder still on disk (so a migration can actually
     move or copy it). Ambiguous states (mixed prefixes, modifiers
     pointing outside ``<blend_dir>/data/``) return ``None``.
+
+    Reads the same assigned-in-an-active-group scope as
+    :func:`_find_missing_pc2_paths`, whose warning this button appears
+    under: a modifier on an unassigned copy is not this project's data, and
+    letting one vote here would either invent a second prefix and suppress
+    the button, or offer to migrate a folder on the strength of a cache
+    nothing is simulating.
     """
     if not bpy.data.filepath:
         return None
     blend_dir = os.path.dirname(bpy.data.filepath)
     current = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
     expected_root = os.path.realpath(os.path.join(blend_dir, "data"))
+    active_uuids = assigned_uuids_in_active_groups(context.scene)
 
     old_names: set[str] = set()
     for obj in bpy.data.objects:
@@ -221,6 +238,8 @@ def _detect_pc2_basename_mismatch(context):
             continue
         mod = obj.modifiers.get(MODIFIER_NAME)
         if mod is None or not mod.filepath:
+            continue
+        if object_pc2_key_readonly(obj) not in active_uuids:
             continue
         abs_path = os.path.realpath(bpy.path.abspath(mod.filepath))
         parent = os.path.dirname(abs_path)
@@ -441,6 +460,17 @@ class SOLVER_PT_SolverPanel(Panel):
         layout = self.layout
         has_dynamic = has_simulatable_dynamics(context.scene)
         box = layout.box()
+        # Every button in this box encodes the scene with cbor2, so an install
+        # whose bundled wheel never landed can do nothing here. Saying so on
+        # THIS panel is what makes the condition findable: the recovery button
+        # lives on the Backend Communicator panel, which a user who only wants
+        # to press Transfer has no reason to open, and without this line their
+        # first sign of trouble is a failure from a button that looked ready.
+        if not cbor2_available():
+            row = box.row()
+            row.label(text=iface_("cbor2 is missing; Transfer and Run cannot encode"), icon="ERROR")
+            row = box.row()
+            row.label(text=iface_("Install it from the Backend Communicator panel"))
         row = box.row()
         row.operator(SOLVER_OT_Transfer.bl_idname, icon="EXPORT")
         row.operator(SOLVER_OT_UpdateParams.bl_idname, icon="OPTIONS")
@@ -483,6 +513,23 @@ class SOLVER_PT_SolverPanel(Panel):
             col = list_box.column(align=True)
             for path in missing_pc2:
                 col.label(text=path)
+
+        # A cache modifier on an object no group claims. Every gate above
+        # ignores it on purpose, so name it here: otherwise it is an
+        # addon-created modifier, usually with a filepath that resolves to
+        # nothing, that the addon will neither act on nor admit exists.
+        orphans = find_orphan_solver_caches(context.scene)
+        if orphans:
+            names = ", ".join(repr(obj.name) for obj in orphans[:3])
+            if len(orphans) > 3:
+                names += iface_(", +{count} more").format(count=len(orphans) - 3)
+            col = box.column(align=True)
+            col.label(
+                text=iface_("Stale cache on {names}").format(names=names),
+                icon="ERROR",
+            )
+            col.label(text=iface_("(not in any group)"))
+            col.operator(SOLVER_OT_RemoveStaleCaches.bl_idname, icon="TRASH")
 
         if is_bake_running():
             done, total, status, _ = bake_progress_snapshot()
@@ -688,6 +735,11 @@ class SOLVER_OT_Transfer(AsyncOperator):
             data, data_hash = encode_obj_with_hash(context)
         except (Cbor2NotInstalledError, ValueError) as e:
             com.set_error(str(e))
+            # A degenerate tessellation is the one refusal that both costs the
+            # artist a Transfer and has a one-click repair, so it gets a dialog
+            # carrying that repair rather than a status-bar line they have to
+            # read sideways. Every other error keeps the reported line alone.
+            popup_transfer_error(e)
             raise StageAbort(str(e))
         self._payload["data"] = data
         self._payload["data_hash"] = data_hash
@@ -702,6 +754,12 @@ class SOLVER_OT_Transfer(AsyncOperator):
         self._payload["param_hash"] = param_hash
 
     def _stage_upload(self, context):
+        # The topology stamp lands HERE, not in the encoder: every stage that
+        # can refuse the Transfer has run by now, so a scene that never reached
+        # the wire does not get recorded as transferred and its stale-topology
+        # warning still fires.
+        state = get_addon_data(context.scene).state
+        state.commit_pending_mesh_hash()
         # Local fetched animation is keyed by the previous upload's data;
         # new data invalidates it, so drop it before kicking the pipeline
         # (matches the prior NO_DATA fast-path behavior).
@@ -805,7 +863,11 @@ class SOLVER_OT_Run(AsyncOperator):
         # here when their geometry edits haven't been pushed yet.
         try:
             local_data = compute_data_hash(context)
-        except ValueError as e:
+        except (Cbor2NotInstalledError, ValueError) as e:
+            # The panel's repair branch reads `com.error`, so a dialog the
+            # artist dismisses would otherwise take the repair with it.
+            com.set_error(str(e))
+            popup_transfer_error(e)
             raise StageAbort(str(e))
         from ..core.facade import engine
         server_data = engine.state.server_data_hash
@@ -818,7 +880,14 @@ class SOLVER_OT_Run(AsyncOperator):
             )
 
     def _stage_check_params(self, context):
-        local_param = compute_param_hash(context)
+        try:
+            local_param = compute_param_hash(context)
+        except (Cbor2NotInstalledError, ValueError) as e:
+            # Same treatment as the geometry check above: a refusal here is
+            # the artist's to act on, so it sets the panel error rather than
+            # reaching the generic encode-failure fallback.
+            com.set_error(str(e))
+            raise StageAbort(str(e))
         from ..core.facade import engine
         server_param = engine.state.server_param_hash
         if server_param and local_param != server_param:
@@ -959,11 +1028,24 @@ class SOLVER_OT_ResumeFrom(AsyncOperator):
             wm.progress_update(0.0)
             try:
                 local_data = compute_data_hash(context)
-            except ValueError as e:
+            except (Cbor2NotInstalledError, ValueError) as e:
+                # See `_stage_check_geometry`: the panel's repair branch reads
+                # `com.error`.
+                com.set_error(str(e))
+                popup_transfer_error(e)
                 self.report({"ERROR"}, str(e))
                 return {"CANCELLED"}
             wm.progress_update(1.0)
-            local_param = compute_param_hash(context)
+            try:
+                local_param = compute_param_hash(context)
+            except (Cbor2NotInstalledError, ValueError) as e:
+                # Same treatment as the geometry refusal above: a parameter
+                # refusal is just as actionable and must not surface as a
+                # traceback with no panel error behind it.
+                com.set_error(str(e))
+                popup_transfer_error(e)
+                self.report({"ERROR"}, str(e))
+                return {"CANCELLED"}
             wm.progress_update(2.0)
         finally:
             wm.progress_end()
@@ -1140,12 +1222,11 @@ class SOLVER_OT_ClearAnimation(Operator):
             return False
         # Recomputed on every redraw (and again via SOLVER_OT_Run.poll, which
         # gates on this result) -- stateless, so it can never go stale the way
-        # a memoized flag can. scene_has_solver_cache scans object modifiers
-        # directly, which is ~100x cheaper than resolving every assigned
-        # object by UUID, so the full scan stays well under a millisecond even
-        # on scenes with thousands of objects.
+        # a memoized flag can. scene_has_solver_cache answers for the same set
+        # of objects execute() clears below, so a cache this button cannot
+        # reach never keeps Run disabled.
         from ..core.pc2 import scene_has_solver_cache
-        return scene_has_solver_cache()
+        return scene_has_solver_cache(context.scene)
 
     def execute(self, context):
         if context.screen and context.screen.is_animation_playing:
@@ -1155,6 +1236,40 @@ class SOLVER_OT_ClearAnimation(Operator):
             resolve_start_frame(get_addon_data(context.scene).state)
         )
         clear_animation_data(context)
+        return {"FINISHED"}
+
+
+class SOLVER_OT_RemoveStaleCaches(Operator):
+    """Remove ContactSolverCache modifiers left on objects that belong to no
+    group, which is what duplicating a simulated object leaves behind. The
+    PC2 files stay on disk: a copy's modifier normally points at the
+    original's cache, and deleting that would take the original's animation
+    with it"""
+
+    bl_idname = "solver.remove_stale_caches"
+    bl_label = "Remove Stale Cache"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(find_orphan_solver_caches(context.scene))
+
+    def execute(self, context):
+        removed = [
+            obj.name
+            for obj in find_orphan_solver_caches(context.scene)
+            if remove_orphan_solver_cache(obj)
+        ]
+        if not removed:
+            self.report({"INFO"}, iface_("No stale caches to remove."))
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            iface_("Removed stale cache from {names}.").format(
+                names=", ".join(removed)
+            ),
+        )
+        redraw_all_areas(context)
         return {"FINISHED"}
 
 
@@ -1604,6 +1719,7 @@ classes = (
     SOLVER_OT_Resume,
     SOLVER_OT_ResumeFrom,
     SOLVER_OT_ClearAnimation,
+    SOLVER_OT_RemoveStaleCaches,
     SOLVER_OT_RecaptureAllDeformations,
     SOLVER_OT_ClearAllDeformations,
     SOLVER_OT_MigratePC2Folder,

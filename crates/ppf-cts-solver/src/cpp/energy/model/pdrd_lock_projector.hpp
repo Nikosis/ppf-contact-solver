@@ -56,6 +56,18 @@ __device__ inline void pdrd_append_constraint(float basis[6][6],
     ++count;
 }
 
+// Remove ALL THREE components of one block of a reduced body vector: the
+// translation block (offset 0) for a center of mass pinned to a point, or the
+// rotation block (offset 3) for a body with no angular freedom at all.
+__device__ inline void pdrd_append_all_lock(float basis[6][6], unsigned &count,
+                                            unsigned offset) {
+    for (unsigned i = 0; i < 3; ++i) {
+        float row[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        row[offset + i] = 1.0f;
+        pdrd_append_constraint(basis, count, row);
+    }
+}
+
 // Add the two forbidden components in either the translation (offset 0) or
 // rotation (offset 3) block of a reduced body vector.
 __device__ inline void pdrd_append_axis_lock(float basis[6][6], unsigned &count,
@@ -73,14 +85,19 @@ __device__ inline void pdrd_append_axis_lock(float basis[6][6], unsigned &count,
     pdrd_append_constraint(basis, count, row1);
 }
 
-// Rotation Lock has two distinct null spaces. Allow-only removes the two
-// tangent directions, while prohibit-axis removes only the selected axis.
+// Rotation Lock has three distinct null spaces. Allow-only removes the two
+// tangent directions, prohibit-axis removes only the selected axis, and
+// all-axes removes the whole rotation block.
 __device__ inline void pdrd_append_rotation_lock(float basis[6][6],
                                                   unsigned &count,
                                                   const Vec3f &axis,
                                                   unsigned mode) {
     assert(mode == ROTATION_LOCK_ALLOW_ONLY ||
-           mode == ROTATION_LOCK_PROHIBIT_AXIS);
+           mode == ROTATION_LOCK_PROHIBIT_AXIS || mode == ROTATION_LOCK_ALL);
+    if (mode == ROTATION_LOCK_ALL) {
+        pdrd_append_all_lock(basis, count, 3u);
+        return;
+    }
     if (mode == ROTATION_LOCK_ALLOW_ONLY) {
         pdrd_append_axis_lock(basis, count, axis, 3u);
         return;
@@ -97,11 +114,24 @@ __device__ inline void pdrd_append_rotation_lock(float basis[6][6],
 // Hinge, translation-lock, and rotation-lock rows are orthonormalized together,
 // so overlapping rotation restrictions are intersected exactly rather than
 // applying noncommuting projectors in sequence.
+//
+// The append ORDER below is load-bearing: modified Gram-Schmidt is
+// order-dependent, so hinge rows first, then translation, then rotation is
+// what keeps a scene that uses only the per-axis modes producing the same
+// basis it would without the all-axes branches.
+//
+// Six rows saturate the space, which is what a body with both all-axes locks
+// asks for, and that is allowed. It needs no special case:
+// pdrd_append_constraint drops an algebraically dependent row on its norm test
+// before reaching `assert(count < 6u)`, and a seventh INDEPENDENT row cannot
+// exist in R^6, so the assert stays a genuine impossibility rather than a
+// bound to raise.
 static __global__ void project_body_dofs_kernel(unsigned nb, unsigned body_base,
                                                 Vec<unsigned> jmode,
                                                 Vec<Vec3f> jaxis,
                                                 Vec<unsigned> tlock,
                                                 Vec<Vec3f> tlock_axis,
+                                                Vec<unsigned> tlock_mode,
                                                 Vec<unsigned> rlock,
                                                 Vec<Vec3f> rlock_axis,
                                                 Vec<unsigned> rlock_mode,
@@ -120,7 +150,13 @@ static __global__ void project_body_dofs_kernel(unsigned nb, unsigned body_base,
         pdrd_append_axis_lock(basis, count, jaxis.data[b], 3u);
     }
     if (tlock.data[b] != RIGID_UNSET) {
-        pdrd_append_axis_lock(basis, count, tlock_axis.data[b], 0u);
+        assert(tlock_mode.data[b] == TRANSLATION_LOCK_AXIS ||
+               tlock_mode.data[b] == TRANSLATION_LOCK_ALL);
+        if (tlock_mode.data[b] == TRANSLATION_LOCK_ALL) {
+            pdrd_append_all_lock(basis, count, 0u);
+        } else {
+            pdrd_append_axis_lock(basis, count, tlock_axis.data[b], 0u);
+        }
     }
     if (rlock.data[b] != RIGID_UNSET) {
         pdrd_append_rotation_lock(basis, count, rlock_axis.data[b],

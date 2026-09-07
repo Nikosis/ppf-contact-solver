@@ -195,10 +195,17 @@ def _encode_pin_config(context, groups, state, fps=None, start_frame=None):
             # SOLID is never skipped on the plain-pin condition: a static
             # (no duration / no pull / no ops) hard-intent SOLID pin must still
             # emit a cfg so it can carry the fix_weight_threshold toggle to the
-            # decoder. Non-SOLID keeps the original skip.
+            # decoder. Non-SOLID keeps the plain-pin skip.
+            # ``allow_intersection`` joins the condition for the same reason
+            # fix_weight_threshold keeps SOLID out of it: it is a per-pin
+            # setting the decoder can only see through a cfg, so a non-SOLID
+            # pin whose ONLY non-default setting is the allowance has to emit
+            # one. Leaving it out of the test would drop that cfg here and the
+            # checkbox would silently do nothing.
             if (group.object_type != "SOLID"
                     and not pin_item.use_pin_duration and not pin_item.use_pull
-                    and not has_operations):
+                    and not has_operations
+                    and not getattr(pin_item, "allow_intersection", False)):
                 continue
             from ..uuid_registry import resolve_pin, get_or_create_object_uuid
             obj = resolve_pin(pin_item)
@@ -251,6 +258,16 @@ def _encode_pin_config(context, groups, state, fps=None, start_frame=None):
                     and group.object_type == "SOLID"
                     and pin_covers_all_vertices(obj, vg_name)):
                 cfg["rest_shape_track"] = True
+            # Per-pin intersection allowance (issue #138). Unlike
+            # rest_shape_track it is gated on nothing here: it applies to every
+            # group type, to both pin modes, and with or without a capture,
+            # because the element-level scope ("every vertex of the face or
+            # segment is held by pins that set this") is resolved in the solver
+            # from the pins it receives, not from mesh coverage the encoder
+            # could measure. Only the True case is emitted, so a decoder that
+            # finds no key leaves the holder at its default of False.
+            if getattr(pin_item, "allow_intersection", False):
+                cfg["allow_intersection"] = True
             if has_operations:
                 ops_list = []
                 # Centroid for CENTROID-mode spin/scale: frame-1 vertex

@@ -12,13 +12,44 @@
 # build ships one native SASS cubin per architecture listed in
 # crates/ppf-cts-solver/src/cpp/cuda_arch.txt and no JIT-able PTX at all, so the
 # default g6/g6e (L4/L40S, sm_89) instances run it while an older card (e.g.
-# a T4, sm_75) has no runnable kernel image.
+# an sm_61 Pascal) has no runnable kernel image. The list reaches down to
+# Turing (sm_75) as of the sm_75 cubin, confirmed on the self-hosted T4.
+#
+# Every dispatch runs BOTH GPUs as parallel jobs, because the two answer
+# different questions and a release wants both: the ephemeral AWS instance
+# above covers the Ampere-or-newer cards the manifest ships for, and
+# `headless-self-hosted` covers the long-lived `ppf-contact-solver-NVIDIA`
+# runner, which carries an older Tesla card and is the only pre-Ampere GPU this
+# project can reach. That second job is how a request to ship a new
+# architecture (a request for Pascal sm_61 and Turing sm_75) gets confirmed on real
+# hardware rather than argued from the manifest. It reports the GPU's compute
+# capability as step CONCLUSIONS, one step per candidate with exactly one
+# running and the rest skipped, because the run logs are not reachable from
+# every environment that needs to read the result.
+#
+# The self-hosted job holds the run open while it waits for its runner, so if
+# that box is ever retired, drop this job rather than leaving it to queue.
 
 name: Getting Started
 
 on:
   workflow_dispatch:
     inputs:
+      arch_source:
+        description: 'self-hosted job only: cubins to build'
+        required: true
+        default: 'manifest'
+        type: choice
+        options:
+          # Ship exactly what cuda_arch.txt lists. A GPU the manifest does not
+          # cover builds fine and then fails to launch, which is the state
+          # a Pascal build was reported to reach.
+          - manifest
+          # Rewrite the checkout's cuda_arch.txt to the capability this runner
+          # actually has, so the run answers "does the solver work on that
+          # architecture" before the manifest is changed for everyone. The
+          # rewrite is local to the job's checkout and never committed.
+          - detected
       instance_type:
         description: 'EC2 instance type'
         required: true
@@ -30,7 +61,7 @@ on:
       region:
         description: 'AWS Region'
         required: true
-        default: 'us-east-2'
+        default: 'ap-northeast-1'
         type: choice
         options:
           - us-east-1
@@ -549,3 +580,142 @@ jobs:
           echo "- Branch: $BRANCH"
           echo "- Example: getting-started"
           echo "- Instance ID: ${{ steps.instance.outputs.INSTANCE_ID || 'Not launched' }}"
+
+  # ---------------------------------------------------------------------------
+  # The pre-Ampere path: the long-lived `ppf-contact-solver-NVIDIA` runner.
+  #
+  # The ephemeral AWS instances above cover Ampere and newer. This job exists
+  # because no AWS instance this project provisions carries a pre-Ampere GPU,
+  # while a community request asks for Pascal (sm_61) and Turing (sm_75).
+  headless-self-hosted:
+    name: Run headless on the self-hosted Tesla runner
+    runs-on: ppf-contact-solver-NVIDIA
+    timeout-minutes: 120
+    permissions:
+      contents: read
+
+    steps:
+      - name: check out repo
+        uses: actions/checkout@v5
+
+      - name: install NVIDIA driver and CUDA toolkit
+        run: |
+          curl -fSsL -O https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get -y install cuda-toolkit-12-8
+
+      - name: read the GPU
+        id: gpu
+        run: |
+          set -eu
+          cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ')
+          echo "sm=$(echo "$cap" | tr -d '.')" >> "$GITHUB_OUTPUT"
+          echo "cap=$cap" >> "$GITHUB_OUTPUT"
+          nvidia-smi
+
+      # The capability, as step conclusions. Exactly one of these runs and the
+      # rest report `skipped`, so the answer is readable from the jobs API
+      # alone, with no access to the run log. Keep the list covering the Tesla
+      # parts a self-hosted box plausibly carries; `unlisted` catches the rest.
+      - name: 'GPU is sm_37 (Kepler, K80) -- NOT buildable, CUDA 12 dropped it'
+        if: steps.gpu.outputs.sm == '37'
+        run: 'true'
+      - name: 'GPU is sm_52 (Maxwell, M60)'
+        if: steps.gpu.outputs.sm == '52'
+        run: 'true'
+      - name: 'GPU is sm_60 (Pascal, P100)'
+        if: steps.gpu.outputs.sm == '60'
+        run: 'true'
+      - name: 'GPU is sm_61 (Pascal, P40 / GTX 10-series) -- requested, not shipped'
+        if: steps.gpu.outputs.sm == '61'
+        run: 'true'
+      - name: 'GPU is sm_70 (Volta, V100)'
+        if: steps.gpu.outputs.sm == '70'
+        run: 'true'
+      - name: 'GPU is sm_75 (Turing, T4 / RTX 20 / GTX 16) -- requested, shipped'
+        if: steps.gpu.outputs.sm == '75'
+        run: 'true'
+      - name: 'GPU is sm_80 (Ampere, A100)'
+        if: steps.gpu.outputs.sm == '80'
+        run: 'true'
+      - name: 'GPU is sm_86 or newer -- already shipped'
+        if: steps.gpu.outputs.sm >= '86'
+        run: 'true'
+      - name: 'GPU capability is unlisted (read the log)'
+        if: >-
+          steps.gpu.outputs.sm != '37' && steps.gpu.outputs.sm != '52' &&
+          steps.gpu.outputs.sm != '60' && steps.gpu.outputs.sm != '61' &&
+          steps.gpu.outputs.sm != '70' && steps.gpu.outputs.sm != '75' &&
+          steps.gpu.outputs.sm != '80' && steps.gpu.outputs.sm < '86'
+        run: 'true'
+
+      # `detected` answers "does the solver work on this architecture" before
+      # the shipped manifest is changed for every user. The floor drops with the
+      # cubin because the -dlto IR must sit at or below every target it is
+      # lowered to; measured on an L40S, lowering it to compute_61 leaves the
+      # sm_89 cubin byte-identical, so the floor is not what makes this risky.
+      - name: rewrite cuda_arch.txt for the detected GPU
+        if: github.event.inputs.arch_source == 'detected'
+        run: |
+          set -eu
+          SM='${{ steps.gpu.outputs.sm }}'
+          MANIFEST=crates/ppf-cts-solver/src/cpp/cuda_arch.txt
+          awk '/^floor|^cubin/{next} {print}' "$MANIFEST" > /tmp/manifest.head
+          { cat /tmp/manifest.head; echo "floor $SM"; echo; echo "cubin $SM"; } > "$MANIFEST"
+          echo "--- cuda_arch.txt for this job only ---"
+          grep -E '^(floor|cubin)' "$MANIFEST"
+
+      - name: warmup
+        run: python3 warmup.py --skip-confirmation
+
+      - name: build
+        run: ~/.cargo/bin/cargo build --release
+
+      - name: verify ppf-cts-py importable via frontend
+        run: |
+          source ~/.local/share/ppf-cts/venv/bin/activate
+          export PYTHONPATH=$PWD
+          python -c "from frontend import _rust as m; print('schema_version', m.schema_version())"
+
+      # A Pascal build was reported to connect and then hang at
+      # frame 0, so a plain "did it fail" is not enough: the exit code is split
+      # into completed / timed out / crashed below, and a hang has to look
+      # different from a crash without reading the log.
+      - name: run headless
+        id: headless
+        run: |
+          set +e
+          echo "getting-started" > frontend/.CI
+          export PYTHONPATH=$PWD
+          timeout 900 ~/.local/share/ppf-cts/venv/bin/python examples/headless.py
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: 'headless COMPLETED on this GPU'
+        if: steps.headless.outputs.rc == '0'
+        run: 'true'
+      - name: 'headless HUNG (timed out at 900s)'
+        if: steps.headless.outputs.rc == '124'
+        run: 'true'
+      - name: 'headless FAILED (solver error, not a hang)'
+        if: steps.headless.outputs.rc != '0' && steps.headless.outputs.rc != '124'
+        run: 'true'
+
+      - name: Collect results
+        if: success() || failure()
+        run: |
+          mkdir -p ci
+          if [ -d "/tmp/ci" ]; then
+            rsync -av --exclude='*.bin' --exclude='*.pickle' /tmp/ci/ ./ci/
+          fi
+          ls -la ci/ || echo "No files collected"
+
+      - name: Upload artifact
+        if: success() || failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-getting-started-self-hosted
+          path: ci
+          retention-days: 3

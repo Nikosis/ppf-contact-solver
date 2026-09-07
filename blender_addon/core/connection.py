@@ -130,6 +130,27 @@ def win_native_server_binary(root):
     return None
 
 
+def win_native_not_found_message(root: str) -> str:
+    """Text for a Windows Native root that holds no ``ppf-cts-server.exe``.
+
+    Says which directory was examined, which two layouts are accepted, and
+    what to do next. The reader of this message is usually an artist who
+    downloaded the prebuilt Windows bundle and has no Rust toolchain, so
+    "build it" cannot be the only instruction: the first thing to check is
+    whether the folder they picked is the extracted bundle root rather than
+    the folder they extracted it INTO, which is the selection this probe
+    cannot resolve on its own (it walks up to a root, never down into one).
+    """
+    return (
+        f"ppf-cts-server.exe not found under {root}. Point Solver Path at the "
+        f"folder that has target\\release\\ppf-cts-server.exe in it (the "
+        f"extracted Windows bundle, or a repo checkout you built), not at the "
+        f"folder you extracted the bundle into and not at the .zip. If you "
+        f"are building from source, run "
+        f"`cargo build --release -p ppf-cts-server` first."
+    )
+
+
 def resolve_win_native_root(selected):
     """Resolve the real Windows Native solver root from a user *selected* path.
 
@@ -223,11 +244,7 @@ def spawn_win_native_server(
     # all-missing layout surfaces the server.exe error first.
     rust_bin = win_native_server_binary(root)
     if rust_bin is None:
-        candidates = [os.path.join(root, *parts) for parts in _WIN_NATIVE_SERVER_SUBPATHS]
-        raise FileNotFoundError(
-            "Rust ppf-cts-server.exe not found in "
-            f"{candidates}. Build with `cargo build --release -p ppf-cts-server`."
-        )
+        raise FileNotFoundError(win_native_not_found_message(root))
 
     build_dir = os.path.join(root, "build-win-native")
     if os.path.exists(os.path.join(build_dir, "python", "python.exe")):
@@ -308,7 +325,10 @@ def connect_win_native(root, port):
         subprocess, which this step does not create.
 
     Raises:
-        FileNotFoundError: if ``ppf-cts-server.exe`` is not at *root*.
+        FileNotFoundError: if no ``ppf-cts-server.exe`` is under *root* (or
+            under an ancestor within the resolver's reach), unless
+            ``PPF_WIN_NATIVE_NO_SPAWN`` says an external orchestrator owns
+            the server.
     """
     # Community users often point the addon at a subdirectory of the real
     # solver root (target/release, bin, or the embedded python/ folder). Walk
@@ -320,6 +340,21 @@ def connect_win_native(root, port):
     # start_server spawns from.
     root = resolve_win_native_root(root) or root.rstrip("/\\")
     root = root.rstrip("/\\")
+
+    # Refuse a root that holds no solver, rather than reporting a connection
+    # and leaving the failure to Start Server. The panel draws
+    # "ppf-cts-server.exe not found" for this directory at the moment it is
+    # set, so a connection reported against it puts that line and "Connected"
+    # on screen together, and only a second button press settles which one is
+    # true. Refusing here keeps the two in agreement.
+    #
+    # PPF_WIN_NATIVE_NO_SPAWN is the test/CI mode where an external
+    # orchestrator owns the server, which is exactly the case where the
+    # binary need not be under this root; the spawn path skips its probes for
+    # the same reason.
+    if not os.environ.get("PPF_WIN_NATIVE_NO_SPAWN"):
+        if win_native_server_binary(root) is None:
+            raise FileNotFoundError(win_native_not_found_message(root))
 
     connection_info = ConnectionInfo()
     connection_info.type = "win_native"

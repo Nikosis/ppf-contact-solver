@@ -166,8 +166,12 @@ def find_degenerate_faces(mesh, area_eps: float) -> dict:
     """Faces whose area is at or below *area_eps*, in local units squared.
 
     A zero-area triangle has no defined normal, so both the contact normal
-    and the bending hinge built on it are undefined. Unlike a duplicate face
-    this is not rejected at Transfer, so it reaches the solver.
+    and the bending hinge built on it are undefined.
+
+    This is an AREA test and sees only the exactly degenerate case. A face
+    whose tessellation is merely near-collinear has real area and passes here
+    while the Transfer gate refuses it, so `degenerate_tessellation` in the
+    same report asks that question separately.
     """
     count = 0
     preview: list[int] = []
@@ -361,6 +365,7 @@ def scan_object(obj, *, merge_threshold: float, area_eps: float) -> dict:
         detect_hanging_stitch_vertices,
         detect_isolated_vertices,
     )
+    from ..core.utils import find_degenerate_tessellation
 
     mesh = obj.data
     particles = is_particle_mesh(obj)
@@ -408,6 +413,17 @@ def scan_object(obj, *, merge_threshold: float, area_eps: float) -> dict:
             else find_surface_defects(mesh)
         ),
         "resplittable": find_resplittable_faces(mesh),
+        # The Transfer gate's own question, asked here too. Certifying a mesh
+        # clean and then refusing the Transfer on it is the one outcome this
+        # tool must not produce, and an exact-area test cannot see a
+        # near-collinear tessellation: the face has real area and its inverse
+        # rest shape is still rounding noise. Same particle exemption as the
+        # other face checks, for the same reason.
+        "degenerate_tessellation": (
+            {"count": 0, "polygons": [], "repairable_polygons": []}
+            if particles
+            else find_degenerate_tessellation(obj)
+        ),
         "linked_duplicate": {"count": len(siblings), "siblings": siblings},
     }
 
@@ -428,6 +444,7 @@ def scan_object(obj, *, merge_threshold: float, area_eps: float) -> dict:
         + defects["hanging_verts"]["count"]
         + defects["duplicate_faces"]["count"]
         + defects["degenerate_faces"]["count"]
+        + defects["degenerate_tessellation"]["count"]
         + defects["linked_duplicate"]["count"]
         + defects["surface"]["bad_winding"]
     )

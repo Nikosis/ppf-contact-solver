@@ -15,6 +15,18 @@ from bpy.props import (  # pyright: ignore
 from bpy.types import PropertyGroup  # pyright: ignore
 
 from ..models.enum_props import EnumProperty
+from ..models.material_maps import SOURCE_TYPE_ITEMS
+
+
+def _material_map_items():
+    """Enum items for the parameter a spatial map drives.
+
+    A plain list, not a dynamic callback: the set is fixed by what the solver
+    can vary per element, so there is nothing to resolve at draw time and no
+    retained-string hazard.
+    """
+    from ..models.material_maps import enum_items
+    return enum_items()
 
 
 def _invalidate_overlay(self=None, ctx=None):
@@ -517,6 +529,25 @@ class AssignedObject(PropertyGroup):
         ),
         update=_invalidate_overlay,
     )  # pyright: ignore
+    # Lock Translation "all axes" mode: with `lock_translation_enable` set,
+    # this pins the center of mass to its initial POINT instead of letting it
+    # slide along `lock_translation_axis`, three constraint rows instead of
+    # two. The axis then has nothing left to say, so the encoder omits it
+    # from the payload entirely: the solver reads the MODE, not the axis, as
+    # the enable bit, and scene build asserts that an all-axes record carries
+    # an exactly zero axis. Unchecked (the default) is the line lock, so a
+    # scene authored without this flag is unchanged.
+    lock_translation_all: BoolProperty(
+        name="Lock All Translations",
+        default=False,
+        description=(
+            "Pin this object's mass-weighted center of mass to its initial "
+            "position instead of letting it slide along the Translation "
+            "Axis. The axis is ignored while this is on. Rotation and "
+            "deformation stay free"
+        ),
+        update=_invalidate_overlay,
+    )  # pyright: ignore
     lock_translation_axis: FloatVectorProperty(
         name="Translation Axis",
         subtype="XYZ",
@@ -544,6 +575,25 @@ class AssignedObject(PropertyGroup):
             "Restrict this object's mass-weighted best-fit rigid rotation "
             "to rotation about a fixed world-space axis. Translation and "
             "deformation stay free"
+        ),
+        update=_invalidate_overlay,
+    )  # pyright: ignore
+    # Lock Rotation "all axes" mode: with `lock_rotation_enable` set, this
+    # forbids net rotation about EVERY axis, three constraint rows, so
+    # neither `lock_rotation_axis` nor `lock_rotation_prohibit_axis` below
+    # has anything left to say and the encoder omits both for such an
+    # object. As with `lock_translation_all` the mode carries the enable
+    # bit, not the axis. Unchecked (the default) leaves the two per-axis
+    # modes exactly as they are. Only the aggregate rotation is removed:
+    # translation and deformation stay free either way.
+    lock_rotation_all: BoolProperty(
+        name="Lock All Rotations",
+        default=False,
+        description=(
+            "Forbid this object's mass-weighted best-fit rigid rotation "
+            "about every axis, not just about the Rotation Axis. The axis "
+            "and its Prohibit Rotation on Axis mode are ignored while this "
+            "is on. Translation and deformation stay free"
         ),
         update=_invalidate_overlay,
     )  # pyright: ignore
@@ -834,6 +884,101 @@ class PinOperation(PropertyGroup):
     )  # pyright: ignore
 
 
+class MaterialMapSample(PropertyGroup):
+    """One later weight source for a spatial material map.
+
+    The map's own source is the weights at the start frame; every sample names
+    a different source reached at its own frame. Between two consecutive
+    samples the weights are the linear interpolation of the two, so a constant
+    hold is two samples naming one source.
+    """
+
+    frame: IntProperty(
+        name="Frame",
+        default=1,
+        min=1,
+        description="Frame at which the weights are exactly this source",
+        options=set(),
+    )  # pyright: ignore
+    source_type: EnumProperty(
+        name="Source",
+        items=SOURCE_TYPE_ITEMS,
+        default="VERTEX_GROUP",
+        description="Where this sample's per-vertex weights come from",
+        options=set(),
+    )  # pyright: ignore
+    source_name: StringProperty(
+        name="Name",
+        default="",
+        description="Vertex group or attribute holding this sample's weights",
+        options=set(),
+    )  # pyright: ignore
+
+
+class MaterialMapItem(PropertyGroup):
+    """One spatial material map on a dynamics group.
+
+    A map varies one parameter across the surface: the effective value at a
+    vertex is ``lerp(base, target, weight)``, with ``base`` the group's own
+    slider. Weight 0 therefore reproduces the unmapped result exactly, which is
+    what keeps the calibrated presets meaningful and is why the blend runs base
+    to target rather than between a minimum and a maximum.
+
+    Each element takes the MEAN of its own vertices' weights. A coefficient
+    varying inside an element would stop the force being the gradient of any
+    energy, so the reduction happens before the values leave the addon.
+    """
+
+    # Explicit numeric ids, permanently assigned in models/material_maps.py:
+    # this PropertyGroup is SAVED, and Blender stores an enum's number rather
+    # than its identifier, so an implicit ordering would repoint every saved map
+    # the moment an entry is inserted.
+    parameter: EnumProperty(
+        name="Parameter",
+        items=_material_map_items(),
+        description="Material parameter this map varies across the surface",
+        options=set(),
+    )  # pyright: ignore
+    source_type: EnumProperty(
+        name="Source",
+        items=SOURCE_TYPE_ITEMS,
+        default="VERTEX_GROUP",
+        description=(
+            "Where the per-vertex weights come from. A vertex group is what "
+            "weight paint writes; a float attribute is read off the evaluated "
+            "mesh, which is where Geometry Nodes writes one"
+        ),
+        options=set(),
+    )  # pyright: ignore
+    source_name: StringProperty(
+        name="Name",
+        default="",
+        description="Vertex group or attribute holding the weights",
+        options=set(),
+    )  # pyright: ignore
+    target_value: FloatProperty(
+        name="Target",
+        default=0.0,
+        # Every mappable material parameter is non-negative. Soft rather than
+        # hard so a typed value is still reported by the encoder, which names
+        # the group and the parameter, rather than being silently clamped.
+        soft_min=0.0,
+        description="Value reached where the weight is 1. The group's own slider is the value at weight 0",
+        options=set(),
+    )  # pyright: ignore
+    enabled: BoolProperty(
+        name="Enable",
+        default=True,
+        description="Include this map in the simulation",
+        options=set(),
+    )  # pyright: ignore
+    samples: CollectionProperty(
+        type=MaterialMapSample,
+        options=set(),
+    )  # pyright: ignore
+    samples_index: IntProperty(default=0, options={"HIDDEN"})  # pyright: ignore
+
+
 class PinVertexGroupItem(PropertyGroup):
 
     def _invalidate_pin_overlay(self, context):
@@ -936,5 +1081,29 @@ class PinVertexGroupItem(PropertyGroup):
             "every vertex of the mesh (a full pin) with a captured deformation; "
             "disabled otherwise. When unchecked, the capture only pulls or "
             "fixes the pinned vertices and the rest pose is unchanged"
+        ),
+    )  # pyright: ignore
+    # Per-pin opt-in, drawn next to Duration / Pull. Off by default, so a
+    # scene that never touches it reports overlaps exactly as it does with no
+    # pin flag set at all. It reaches the solver as the pin's
+    # ``allow_intersection`` flag: the solver tolerates an overlap only for a
+    # face or segment ALL of whose vertices are held by pins that set this, so
+    # a pin covering part of a face changes nothing there.
+    #
+    # A new BoolProperty is new RNA, so Blender must be RESTARTED for it to
+    # register; the addon's soft reload (the ``reload`` debug command) does not
+    # pick it up.
+    allow_intersection: BoolProperty(
+        name="Allow Intersections Here",
+        default=False,
+        description=(
+            "Accept an overlap of the geometry this pin holds instead of "
+            "stopping the simulation, such as a cuff that starts inside the "
+            "wrist it is pulled onto. A face counts only where the pin holds "
+            "every corner of it, a rod segment only where it holds both ends. "
+            "One side of an overlap is enough, so a partly pinned face is "
+            "still accepted when the geometry it meets is fully held. Contact "
+            "still acts on the overlap: the error is suppressed, not the "
+            "collision"
         ),
     )  # pyright: ignore

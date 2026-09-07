@@ -144,6 +144,10 @@ OBJECT_GROUP_DEFAULTS = {
     # exactly as it did before the feature existed.
     "bend_warp": 0.0,
     "bend_weft": 0.0,
+    # Intersection tolerances (issue #138). Both default off, so a group that
+    # never touches them reaches the solver exactly as it did before.
+    "allow_self_intersection": False,
+    "allow_inter_object_intersection": False,
     "shrink_x": 1.0,
     "shrink_y": 1.0,
     "enable_inflate": False,

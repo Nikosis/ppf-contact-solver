@@ -169,10 +169,14 @@ if [ "$UNINSTALL" = true ]; then
 fi
 
 # Fetch the cbor2 wheels declared in blender_manifest.toml. They are
-# gitignored; without them Blender will refuse to enable the extension
-# because the wheel paths in the manifest won't resolve. fetch.py is
-# idempotent: re-runs are no-ops when the local files already match
-# the pinned sha256 digests.
+# gitignored, and Blender does NOT refuse to enable an extension whose
+# manifest names wheels that are not there: it enables it, registers every
+# operator, and the add-on then fails on the first Transfer with
+# "No module named 'cbor2'". So this fetch is what makes the install
+# complete, and it is not optional. fetch.py is idempotent: re-runs are
+# no-ops when the local files already match the pinned sha256 digests, so
+# an offline machine that already has them is fine, and one that does not
+# fails here rather than silently installing an add-on that cannot encode.
 PYTHON_BIN="${PPF_PYTHON_BIN:-}"
 if [ -z "$PYTHON_BIN" ]; then
   if command -v python3 >/dev/null 2>&1; then

@@ -13,6 +13,7 @@ import bpy  # pyright: ignore
 from ..core.client import RemoteStatus
 from ..core.client import communicator as com
 from ..core.derived import is_server_busy_from_response as is_running
+from ..core.module import Cbor2NotInstalledError
 from bpy.props import StringProperty  # pyright: ignore
 from bpy.types import Operator  # pyright: ignore
 from bpy.app.translations import pgettext_iface as iface_, pgettext_tip as tip_
@@ -205,7 +206,7 @@ class DEBUG_OT_TransferWithoutBuild(TransferRequestMixin, AsyncOperator):
             try:
                 from ..core.encoder import prepare_upload
                 data, param, data_hash, param_hash = prepare_upload(context)
-            except ValueError as e:
+            except (Cbor2NotInstalledError, ValueError) as e:
                 self.report({"ERROR"}, str(e))
                 com.set_error(str(e))
                 redraw_all_areas(context)

@@ -355,6 +355,20 @@ class DeviceOperators {
 // subspace. Well-conditioned blocks are unaffected: no eigenvalue is clamped and
 // the reconstruction agrees with the cofactor inverse.
 __device__ static Mat3x3f invert(const Mat3x3f &m) {
+    // The finiteness test belongs on the INPUT, not on the eigenvalues.
+    // solve_symm_eigen3x3 answers an all-NaN matrix with lambda = (0, 0, 0),
+    // so lmax comes back a finite zero and `isfinite(lmax)` below sees nothing
+    // wrong; only the positivity test would fire, and it would name a
+    // non-positive block when the real fault is a non-finite one. Measured on
+    // issue #144, where every entry of this block arrived NaN from the elastic
+    // stencil and the eigenvalues read exactly zero.
+    bool finite_in = true;
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            finite_in = finite_in && isfinite(m(a, b));
+        }
+    }
+    assert(finite_in);
     // Enforce exact fp32 symmetry (the assembled block is symmetric only up to
     // atomic-accumulation order) before the eigensolve.
     Mat3x3f sym;
@@ -376,7 +390,14 @@ __device__ static Mat3x3f invert(const Mat3x3f &m) {
     // here rather than return something plausible: a zero preconditioner block
     // would NOT trip the PCG SPD guards (it contributes exactly 0 to r.z and
     // pAp, never a negative), it would silently freeze this vertex's DOF at its
-    // seed for every CG iteration. Asserts are live in the production build.
+    // seed for every CG iteration. Asserts are live in the cargo build; the
+    // Windows build passes -DNDEBUG and compiles them out, which is why the
+    // host-side rest-shape guard rather than this one is what a shipped
+    // Windows binary relies on.
+    //
+    // This second test still covers the eigensolve itself: `finite_in` above
+    // clears the input, and a non-finite lmax from a finite input would be a
+    // fault in solve_symm_eigen3x3.
     assert(isfinite(lmax));
     assert(lmax > 0.0f);
     Mat3x3f minv = Mat3x3f::Zero();
@@ -1737,9 +1758,12 @@ cg_rigid_translation_locked(
     auto gb = pool.get<float>(3 * ngrp);
     float *g0 = gb.data, *gc = g0 + ngrp, *gr = gc + ngrp;
 
-    // A hinge permits no translation. A requested perpendicular affine
-    // correction is therefore genuinely infeasible, not something to silently
-    // drop by composing the two projectors.
+    // A hinge permits no translation. A requested affine correction is
+    // therefore genuinely infeasible, not something to silently drop by
+    // composing the two projectors. The residual below is the FULL norm of the
+    // drift, so it covers both translation-lock modes without a branch: an
+    // axis mode contributes nothing along its own axis, and an all-axes mode
+    // constrains every direction.
     if (rm.any_translation_lock) {
         std::vector<unsigned> hmode(nb), hlock(nb);
         std::vector<Vec3f> hdrift(data.translation_lock.size);
@@ -1773,9 +1797,9 @@ cg_rigid_translation_locked(
                 ppf_fatal(PPF_FATAL_SOLVER_INVARIANT,
                           "PPF FATAL: PDRD body %u has both a hinge and a "
                           "translation lock, but its current COM requires a "
-                          "perpendicular translation of %.6e. The hinge "
-                          "removes that DOF, so the requested lock correction "
-                          "is infeasible.\n",
+                          "constrained translation of %.6e. The hinge removes "
+                          "that DOF, so the requested lock correction is "
+                          "infeasible.\n",
                           body + 1u, (double)residual);
             }
         }
@@ -2240,8 +2264,8 @@ bool solve(const DynCSRMat &A, const FixedCSRMat &B, const Vec<Mat3x3f> &C,
             const unsigned lock_count = data.translation_lock.size;
             auto lock_frames =
                 pool.get<translation_lock::LockFrame>(lock_count);
-            auto lock_gram = pool.get<Mat4x4f>(lock_count);
-            auto lock_sums = pool.get<Vec4f>(lock_count);
+            auto lock_gram = pool.get<Mat6x6f>(lock_count);
+            auto lock_sums = pool.get<Vec6f>(lock_count);
             auto lock_drift = pool.get<Vec3f>(lock_count);
             auto lock_torque = pool.get<Vec3f>(lock_count);
             auto lock_q = pool.get<float>(3 * vertex_count);
@@ -2294,8 +2318,8 @@ bool solve(const DynCSRMat &A, const FixedCSRMat &B, const Vec<Mat3x3f> &C,
     if (aggregate_locked) {
         const unsigned lock_count = data.translation_lock.size;
         auto lock_frames = pool.get<translation_lock::LockFrame>(lock_count);
-        auto lock_gram = pool.get<Mat4x4f>(lock_count);
-        auto lock_sums = pool.get<Vec4f>(lock_count);
+        auto lock_gram = pool.get<Mat6x6f>(lock_count);
+        auto lock_sums = pool.get<Vec6f>(lock_count);
         auto lock_drift = pool.get<Vec3f>(lock_count);
         auto lock_torque = pool.get<Vec3f>(lock_count);
         auto lock_q = pool.get<float>(3 * vertex_count);

@@ -453,6 +453,9 @@ class CommunicatorFacade:
     def take_one_animation_frame(self):
         return self._runner.take_one_animation_frame()
 
+    def has_pending_animation_frames(self) -> bool:
+        return self._runner.has_pending_animation_frames()
+
     @property
     def animation(self):
         """Legacy animation data accessor."""
@@ -572,9 +575,12 @@ def _persistent_tick() -> float:
     if not _addon_ready:
         return _TICK_INTERVAL_S
     try:
-        # Keep the frame-pump modal alive. It can die on file-open or
-        # reload teardown; this re-invokes it so apply_animation +
-        # MESH_CACHE heal keep running without user intervention.
+        # Start the frame-pump modal whenever there is work for it, so
+        # apply_animation + MESH_CACHE heal run without user
+        # intervention after a file-open or reload teardown cancels it.
+        # ensure_modal_running is a no-op while the pump has nothing to
+        # do, which is what leaves Blender free to auto-save: Blender
+        # skips auto-save for as long as any modal handler is attached.
         try:
             from . import frame_pump
             frame_pump.ensure_modal_running()
@@ -586,6 +592,20 @@ def _persistent_tick() -> float:
         # Those are driven from PPF_OT_FramePump.modal() instead, whose
         # modal-operator timer events run in a permissive context. This
         # tick only does Python-side engine polling and event dispatch.
+        #
+        # Keep the SSH panel current. REMOTE_OT_Connect's modal finishes
+        # at the end of the handshake rather than holding a modal handler
+        # open for the connection's lifetime, which would stop Blender
+        # autosaving for the whole session, so this tick owns the refresh
+        # afterwards. It only tags a redraw when the watched status
+        # actually changed, and runs at the same 0.25s cadence the modal
+        # used, so it must sit ahead of the idle early-return below: a
+        # connection can come up and go down with the engine idle.
+        try:
+            from ..ui.main_panel import refresh_ssh_panel
+            refresh_ssh_panel()
+        except Exception:
+            pass
         if _engine_is_idle():
             _watchdog_reset()
             return _TICK_INTERVAL_S

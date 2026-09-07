@@ -113,6 +113,14 @@ class AsyncOperator(Operator):
         except Exception as exc:  # noqa: BLE001 - surface any encode failure
             self._end_stages()
             self.cleanup_modal(context)
+            # Record it on the connection as well, not only in the status bar.
+            # ``self.report`` writes a line that the next redraw clears, so an
+            # unclassified encode failure would otherwise leave the panel
+            # looking healthy while nothing had been uploaded. The stages that
+            # recognize their own refusals already do this; doing it here too
+            # means every encode failure is visible in the same place.
+            from .client import communicator
+            communicator.set_error(str(exc))
             self.report({"ERROR"}, iface_("Encoding failed: {error}").format(error=exc))
             redraw_all_areas(context)
             return {"CANCELLED"}
