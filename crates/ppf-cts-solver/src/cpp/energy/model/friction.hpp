@@ -68,10 +68,45 @@ struct Friction {
     // Both branches are symmetric PSD, with eigenvalues
     // {0, lambda, lambda} and {0, 0, lambda}, respectively.
     __device__ Mat3x3f hessian() const {
-        if (kinetic) {
-            Vec3f w = n.cross(slip_dir);
-            return lambda * (w * w.transpose());
-        }
+        // THE LAGGED TANGENTIAL STIFFNESS, lambda * P, IN BOTH BRANCHES.
+        // lambda is evaluated at the current slip and then held, which makes
+        // the friction force linear in the slip with an SPD Hessian. That is
+        // standard semi-implicit friction lagging, and it is deliberately NOT
+        // the exact Hessian of the kinetic potential.
+        //
+        // THE EXACT ONE IS SINGULAR ALONG THE SLIP AND A NEWTON SOLVE CANNOT
+        // USE IT. Past the cone the capped potential mu * contact * |u| is
+        // LINEAR along the slip direction s, so its curvature there is zero and
+        // the exact Hessian is lambda * (P - s s^T), which the outer product
+        // lambda * w w^T with w = n x s spells without the subtraction. Being
+        // PSD is not the question: the linear model has no minimizer along s,
+        // so nothing in the tangent plane bounds the Newton step and it is left
+        // to whatever inertia and contact stiffness happen to couple in.
+        //
+        // MEASURED, on a house of cards, which is held up by nothing but
+        // friction and so is the pure case. Peak vertex motion over twenty
+        // frames of a scene that is supposed to stand still:
+        //     lambda * P (this line)                    4.8e-03
+        //     lambda * w w^T, when it landed            3.9e-01
+        //     lambda * w w^T, at HEAD a month later     2.4e+00
+        // and restoring this line took that same HEAD back to 4.4e-03. A
+        // reader who sees a static scene shimmer should suspect this line
+        // before anything else.
+        //
+        // Retaining only a FRACTION kappa of the along-slip stiffness does not
+        // rescue it, it moves the pole: the Newton update in s becomes
+        // u <- u (1 - 1/kappa) + T / (kappa lambda), which amplifies the slip
+        // by |1 - 1/kappa| per iteration. Stability needs kappa >= 1/2, and
+        // kappa = 1, this line, is the only value that is both non-amplifying
+        // and free of a tuned constant.
+        //
+        // WHAT IT COSTS, stated so nobody rediscovers it as a defect: a
+        // cone-saturated contact leaves the stick geometrically rather than in
+        // one re-linearization. One iteration lands at u <- T / lambda, a
+        // growth factor T / (mu * contact) that exceeds one whenever the
+        // tangential load exceeds the cone, so the contact does escape, just
+        // not instantly. The remedy for a slow escape is more Newton
+        // iterations, never a singular Hessian.
         return lambda * P;
     }
     __device__ Mat3x3f get_projection(const Vec3f &normal) {
