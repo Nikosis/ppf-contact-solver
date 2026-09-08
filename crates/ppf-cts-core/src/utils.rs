@@ -847,13 +847,13 @@ mod tests {
         let un = format!(
             "{}",
             GpuError::SmUnsupported {
-                name: "GeForce GTX 1660".into(),
-                actual: 75,
+                name: "GeForce GTX 980".into(),
+                actual: 52,
                 supported: supported_sm_list(),
             }
         );
-        assert!(un.contains("GeForce GTX 1660"));
-        assert!(un.contains("sm_75")); // the detected, unsupported arch
+        assert!(un.contains("GeForce GTX 980"));
+        assert!(un.contains("sm_52")); // the detected, unsupported arch
         assert!(un.contains("sm_86")); // the supported set is spelled out
         assert!(un.contains("sm_120"));
     }
@@ -863,6 +863,9 @@ mod tests {
         // A shipped cubin covers its own arch and higher minors in the same
         // major (SASS forward minor-compat), but never a different major or a
         // lower minor.
+        assert!(sm_is_supported(61)); // Pascal (GTX 10, Titan Xp)
+        assert!(sm_is_supported(62)); // Pascal minor bump: sm_61 cubin, 1 <= 2
+        assert!(sm_is_supported(75)); // Turing (RTX 20, GTX 16, T4)
         assert!(sm_is_supported(86)); // Ampere (RTX 30, A40)
         assert!(sm_is_supported(87)); // Jetson Orin: sm_86 cubin, 6 <= 7
         assert!(sm_is_supported(89)); // Ada (RTX 40, L40S)
@@ -872,8 +875,8 @@ mod tests {
         assert!(sm_is_supported(121)); // hypothetical Blackwell minor bump
 
         assert!(!sm_is_supported(80)); // A100: same major but minor 0 < 6
-        assert!(!sm_is_supported(75)); // Turing (RTX 20 / GTX 16)
-        assert!(!sm_is_supported(61)); // Pascal (GTX 10)
+        assert!(!sm_is_supported(60)); // Tesla P100: Pascal major, minor 0 < 1
+        assert!(!sm_is_supported(52)); // Maxwell (GTX 900): no cubin shipped
         assert!(!sm_is_supported(130)); // future major, no cubin shipped yet
     }
 }

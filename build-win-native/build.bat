@@ -305,7 +305,10 @@ REM trusting any comparison drawn from it.
 REM
 REM Do NOT substitute --split-compile, which parallelizes by narrowing the
 REM optimizer's scope and emitted 1.6%% more SASS in the hottest device code.
-%NVCC% -shared -dlto -t 0 !GENCODE! -Xcompiler "/MD" !OBJS! -lcudart -o "%LIB_DIR%\libsimbackend_cuda.dll"
+REM -Wno-deprecated-gpu-targets matches NVCC_COMMON: the -gencode list lands at
+REM the device link, and nvcc 12.8 warns per deprecated target now that the
+REM floor and the sm_61 cubin are both below 75.
+%NVCC% -shared -dlto -t 0 -Wno-deprecated-gpu-targets !GENCODE! -Xcompiler "/MD" !OBJS! -lcudart -o "%LIB_DIR%\libsimbackend_cuda.dll"
 if errorlevel 1 (
     echo ERROR: nvcc device-link failed
     exit /b 1

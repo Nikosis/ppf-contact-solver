@@ -48,7 +48,7 @@ NVCC_FLAGS += $(foreach warn,$(SUPPRESS_WARNINGS),--diag-suppress=$(warn))
 # kernels (a 255-register ABI call otherwise) and roughly halving contact
 # matrix-assembly cost.
 #
-# The LTO IR sits at the floor virtual arch (compute_75 as shipped), and every
+# The LTO IR sits at the floor virtual arch (compute_61 as shipped), and every
 # device target in the link below emits native SASS from that IR.
 # IMPORTANT: device LTO CANNOT embed a JIT-able PTX. The -dlto link lowers its IR
 # straight to SASS; a code=compute_XX request is silently dropped (verified with
@@ -105,8 +105,15 @@ $(OUT_DIR)/cpp/%.o: %.cpp Makefile
 # also runs sm_87 (Jetson Orin) and sm_89 (Ada: RTX 40, L40S); each new MAJOR
 # needs its own cubin. A brand-new arch not listed here fails to launch ("named
 # symbol not found") until its cubin is added and the lib rebuilt.
-#   sm_75  Turing     RTX 20, GTX 16, T4     (oldest shipped; requested, and
-#                                             the self-hosted CI runner's card)
+#   sm_61  Pascal     GTX 10, Titan Xp       (oldest shipped; issue #141. Covers
+#                                             sm_61 and higher minors only, so
+#                                             sm_60 (Tesla P100) is NOT included.
+#                                             nvcc 12.8 warns that targets below
+#                                             75 are deprecated and will be
+#                                             dropped in a future CUDA release,
+#                                             which is when this row has to go.)
+#   sm_75  Turing     RTX 20, GTX 16, T4     (requested, and the self-hosted CI
+#                                             runner's card)
 #   sm_86  Ampere     RTX 30, A10/A40/A6000  (+ sm_87 Orin, sm_89 Ada via compat)
 #   sm_89  Ada        RTX 40, L40S, L4       (native; perf on the dev/CI GPU)
 #   sm_90  Hopper     H100, H200, GH200
@@ -146,7 +153,12 @@ $(OUT_DIR)/cpp/%.o: %.cpp Makefile
 # would then also feed the manifest to nvcc as an input file, hence $(filter-out).
 $(LIBDIR)/libsimbackend_cuda.so: $(CUDA_OBJS) $(SIMPLELOG_OBJS) $(STUB_OBJS) $(CUDA_ARCH_FILE)
 	mkdir -p $(LIBDIR)
-	$(NVCC) -shared -dlto -t 0 $(CUDA_GENCODE) -o $@ $(filter-out $(CUDA_ARCH_FILE),$^)
+	# -Wno-deprecated-gpu-targets is on the compile flags too. It is needed HERE
+	# as well because the -gencode list lands at the device link, and nvcc 12.8
+	# warns once per deprecated target: the floor and the sm_61 cubin are both
+	# below the 75 it now considers current. The Makefile arch table says when
+	# that row has to come out; this only keeps the link log readable until then.
+	$(NVCC) -shared -dlto -t 0 -Wno-deprecated-gpu-targets $(CUDA_GENCODE) -o $@ $(filter-out $(CUDA_ARCH_FILE),$^)
 
 # SimpleLog library (for standalone use)
 $(LIBDIR)/libsimplelog.so: $(SIMPLELOG_OBJS)

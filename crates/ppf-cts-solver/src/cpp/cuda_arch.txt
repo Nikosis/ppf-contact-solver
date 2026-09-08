@@ -10,6 +10,14 @@
 ;     gate check_gpu() applies before a run starts,
 ;   * the shipped-architecture text main.cu prints when it rejects a device.
 ;
+; A build file that names an architecture instead of deriving it here fails the
+; solver build: arch_literal_guard in ppf-cts-solver/build.rs walks every
+; Makefile and .bat under the CUDA source and the native Windows build, and
+; rejects a digit after -arch= or code=, which is what a literal looks like and
+; what a variable expansion does not. It discovers those files rather than
+; listing them, so a build file added later is covered without being registered
+; anywhere.
+;
 ; Adding a GPU generation is one line here plus a rebuild; removing one is the
 ; same edit. Both build paths, the runtime gate and the build-time check of the
 ; artifact all read this file, so none of them can disagree with another.
@@ -30,8 +38,9 @@
 ;        covers a device of the same major whose minor is at or above it.
 ; cubin  One native SASS cubin, by compute capability (major * 10 + minor).
 
-floor 75
+floor 61
 
+cubin 61
 cubin 75
 cubin 86
 cubin 89

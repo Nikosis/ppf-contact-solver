@@ -97,6 +97,15 @@ fn main() {
     // this file to honor the switch.
     let emulated = env::var("CARGO_FEATURE_EMULATED").is_ok();
 
+    // Every CUDA architecture this project targets comes from cuda_arch.txt.
+    // `arch_guard` below checks the ARTIFACT matches the manifest; this checks
+    // the SOURCE never states an architecture of its own, which is the failure
+    // the artifact check cannot see: a build file pinned to its own arch
+    // produces a perfectly self-consistent image of the wrong thing, and the
+    // kernel-test harness sat at a hardcoded sm_70 through several floor moves
+    // exactly that way. Runs unconditionally, CUDA present or not.
+    arch_literal_guard::check();
+
     // Guard: never build the EMULATED (CPU stub) backend on a machine that can
     // build CUDA. The emulator produces NO real physics yet is written to the
     // same target/release/ path as the real solver/server, so it silently
@@ -250,6 +259,105 @@ fn main() {
 // flags. Each of those ships a binary that the run-time gate then advertises
 // support the image does not have, which is the exact failure a user meets as
 // "no kernel image is available for execution on the device".
+mod arch_literal_guard {
+    use std::path::{Path, PathBuf};
+
+    /// Directories that may contain a CUDA build file. Both exist in every tree,
+    /// so this guard behaves identically wherever it runs; naming DIRECTORIES
+    /// rather than files is also what lets it catch a build file nobody has
+    /// written yet, which a fixed list of paths cannot.
+    const ROOTS: &[&str] = &["src/cpp", "../../build-win-native"];
+
+    /// The flag contexts an architecture can appear in. A digit straight after
+    /// one of these is a literal; a `$`, `!` or `%` is a make / cmd.exe variable
+    /// expansion, which is what deriving from the manifest looks like in each of
+    /// the two build languages.
+    const CONTEXTS: &[&str] = &[
+        "arch=compute_",
+        "arch=sm_",
+        "code=sm_",
+        "code=lto_",
+        "code=compute_",
+    ];
+
+    fn is_build_file(p: &Path) -> bool {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        name == "Makefile" || name.ends_with(".mk") || name.ends_with(".bat")
+    }
+
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Build outputs and vendored trees carry generated makefiles that
+            // are not ours to police.
+            if matches!(name, "target" | "build-tests" | ".git" | "node_modules") {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, out);
+            } else if is_build_file(&p) {
+                out.push(p);
+            }
+        }
+    }
+
+    fn offenders(text: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for (n, line) in text.lines().enumerate() {
+            for ctx in CONTEXTS {
+                let mut from = 0usize;
+                while let Some(i) = line[from..].find(ctx) {
+                    let at = from + i + ctx.len();
+                    if line[at..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                        out.push((n + 1, line.trim().to_string()));
+                    }
+                    from = at;
+                }
+            }
+        }
+        out
+    }
+
+    pub fn check() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        for rel in ROOTS {
+            let dir = root.join(rel);
+            println!("cargo:rerun-if-changed={}", dir.display());
+            walk(&dir, &mut files);
+        }
+        if files.is_empty() {
+            panic!(
+                "arch_literal_guard found no build files under {ROOTS:?}: it proved \
+                 nothing. Fix the roots rather than letting the guard pass on no \
+                 evidence."
+            );
+        }
+        let mut found: Vec<String> = Vec::new();
+        for f in &files {
+            println!("cargo:rerun-if-changed={}", f.display());
+            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            for (line_no, line) in offenders(&text) {
+                let shown = f.strip_prefix(&root).unwrap_or(f);
+                found.push(format!("  {}:{}: {}", shown.display(), line_no, line));
+            }
+        }
+        if !found.is_empty() {
+            panic!(
+                "hardcoded CUDA architecture in a build file:\n{}\n\n\
+                 cuda_arch.txt is the single source for every architecture this \
+                 project targets, and each consumer derives from it. Read the floor \
+                 or the cubin list from that file instead of naming an architecture \
+                 here; the Makefile beside it has the awk one-liner both build paths \
+                 use.",
+                found.join("\n")
+            );
+        }
+    }
+}
+
 mod arch_guard {
     use std::path::Path;
     use std::process::Command;
