@@ -34,7 +34,7 @@ involving 👚 shells, 🪵 solids, 🪢 rods, 🧱 rigid bodies and ⏳ sand. S
 - **🦀 Rust-First**: We minimize the use of C++ to maximize safety. No performance compromised.
 - **⏲ Scalable**: An extreme case includes beyond 180M contacts. Not just one million.
 - **🚲 Cache Efficient**: All on the GPU runs in single precision. No double precision.
-- **🥼 Not Rubbery**: Triangles never extend beyond strict upper bounds (e.g., 1%).
+- **🥼 Not Rubbery**: Any single triangle never extends beyond strict upper bounds (e.g., 1%).
 - **📐 Finite Element Method**: We use FEM for deformables and symbolic force jacobians.
 - **📊 Parameters Calibrated**: Fabric presets match real measurements [(Report)](https://st-tech.github.io/ppf-contact-solver/fabric-report/index.html).
 - **⚔️ Highly Stressed**: We run GitHub Actions to run stress tests [10 times in a row](#️-ten-consecutive-runs).
