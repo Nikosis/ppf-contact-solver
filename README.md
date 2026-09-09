@@ -50,33 +50,17 @@ involving 👚 shells, 🪵 solids, 🪢 rods, 🧱 rigid bodies and ⏳ sand. S
 - **✨ Stay Clean**: You can remove all traces after use.
 - **📜 Permissive License**: Apache 2.0 allows commercial and proprietary use.
 
-> ⚠️ Built for offline uses; not real time. Some examples may run at an interactive rate.
-
 > <a name="note-penetration-free"></a>[1] **What the guarantee means:**
 >
-> - Our [cubic barrier](#-technical-materials) theoretically guarantees penetration-free contact, so the guarantee is by construction and not a heuristic.
-> - Implementations do have bugs, of course, and we make no claim that a run never crashes.
-> - But upon a successful run we explicitly run an intersection checker, which confirms no penetration anywhere, 100%. Our [GitHub Actions](#-github-actions) do the same at the end of every step.
-> - **We never leave hidden snagging intersections behind. Not 99% resolved, with 1% sneakily left tangled.**
+> Our [cubic barrier](#-technical-materials) theoretically guarantees penetration-free contact by construction, not heuristics. Bugs and crashes remain possible, but an intersection checker confirms **zero penetration** after every successful run and every step in [GitHub Actions](#-github-actions). No hidden intersections are left behind.
 >
-> **When an intersection error appears:**
->
-> - It is not always a bug. The configuration itself may structurally admit no penetration-free solution, such as two pinned panels driven through each other ([#116](https://github.com/st-tech/ppf-contact-solver/issues/116)) or cloth caught inside a character animation that already self-intersects ([#110](https://github.com/st-tech/ppf-contact-solver/issues/110)).
-> - Stopping there is **intended behavior**. Finishing such a run would mean silently accepting penetration, breaking the guarantee above.
-> - Please check the scene for an impossible setup before reporting a bug.
+> **Intersection errors can indicate an impossible setup**, such as pinned panels driven through each other ([#116](https://github.com/st-tech/ppf-contact-solver/issues/116)) or cloth trapped in a self-intersecting character animation ([#110](https://github.com/st-tech/ppf-contact-solver/issues/110)). Stopping preserves the guarantee; completing would silently accept penetration. Check the scene before reporting a bug.
 
 ### 🚧 A Gentle Disclaimer
 
-#### Not Production Ready
-
-- ZOZO's Contact Solver is not mature software, and we do not recommend it for production use. It still carries many bugs.
-- The bugs we know about are tracked in [Issues](https://github.com/st-tech/ppf-contact-solver/issues) and fixed once confirmed. Others are certainly still hiding.
-
-#### Development Pace
-
-- Development is active, but not at the pace of a team-driven project.
-- This repository is maintained by a single person, Ryoichi Ando, who cannot devote all of his effort to it.
-- Please keep this in mind when planning around this solver. Thank you for your patience and understanding.
+- **Offline use:** Built for offline simulation, not real time, though some examples reach interactive rates.
+- **Not production ready:** ZOZO's Contact Solver is immature and has many bugs, including undiscovered ones. Production use is not recommended. Known bugs are tracked in [Issues](https://github.com/st-tech/ppf-contact-solver/issues) and fixed once confirmed.
+- **Development pace:** Actively maintained by Ryoichi Ando alone, with limited time rather than a team's capacity.
 
 ## 🔖 Table of Contents
 
