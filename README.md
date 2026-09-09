@@ -852,11 +852,11 @@ Below, we describe how to deploy our solver on major cloud services. These instr
 </tr>
 <tr>
 <td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=ivDtWRFewVM"><img src="https://img.youtube.com/vi/ivDtWRFewVM/maxresdefault.jpg" alt="Houdini Level Cloth Simulation in Blender?"></a></td>
-<td width="50%" valign="top"></td>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=R-5sL80WKoc"><img src="https://img.youtube.com/vi/R-5sL80WKoc/hqdefault.jpg" alt="This Blender Addon Makes Cloth Simulation SO Much Better"></a></td>
 </tr>
 <tr>
 <td valign="top"><a href="https://www.youtube.com/watch?v=ivDtWRFewVM"><em>Houdini Level Cloth Simulation in Blender?</em></a> by <a href="https://www.youtube.com/@InspirationTuts">InspirationTuts</a>.</td>
-<td valign="top"></td>
+<td valign="top"><a href="https://www.youtube.com/watch?v=R-5sL80WKoc"><em>This Blender Addon Makes Cloth Simulation SO Much Better</em></a> by <a href="https://www.youtube.com/@Megani21">Megani</a>.</td>
 </tr>
 </table>
 
