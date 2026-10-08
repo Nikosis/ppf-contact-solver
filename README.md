@@ -894,11 +894,11 @@ Below, we describe how to deploy our solver on major cloud services. These instr
 </tr>
 <tr>
 <td width="50%" valign="top"><a href="https://youtu.be/ZagGwtRO3Ss?si=vbAPHeBAPhbqdemM&t=684"><img src="https://img.youtube.com/vi/ZagGwtRO3Ss/maxresdefault.jpg" alt="Blender 5.2 Cloth Simulation + The Secret to Better Collisions"></a></td>
-<td width="50%" valign="top"></td>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=z5D5iCBqMKI"><img src="https://img.youtube.com/vi/z5D5iCBqMKI/maxresdefault.jpg" alt="This FREE Blender Add-on Could Solve Your Cloth Problems"></a></td>
 </tr>
 <tr>
 <td valign="top"><a href="https://youtu.be/ZagGwtRO3Ss?si=vbAPHeBAPhbqdemM&t=684"><em>Blender 5.2 Cloth Simulation + The Secret to Better Collisions</em></a> by <a href="https://www.youtube.com/@styliz3d">Styliz 3D</a>.</td>
-<td valign="top"></td>
+<td valign="top"><a href="https://www.youtube.com/watch?v=z5D5iCBqMKI"><em>This FREE Blender Add-on Could Solve Your Cloth Problems</em></a> by <a href="https://www.youtube.com/@blenderhub7">BlenderHub</a>.</td>
 </tr>
 </table>
 
